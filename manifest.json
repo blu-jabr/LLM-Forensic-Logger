@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Forensic Logger",
+  "version": "1.0",
+  "description": "Logs LLM chat rounds to local filesystem as MD and JSON.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://chatgpt.com/*",
+    "*://claude.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "LLM Forensic Logger"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["*://chatgpt.com/*", "*://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
