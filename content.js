@@ -33,7 +33,6 @@ function processLatestRound(durationMs) {
             const mod = window.ForensicModules[moduleName];
             if (mod.match(host, path)) {
                 extractedData = mod.extract();
-                console.log(`[Forensic Logger] Module matched: ${moduleName}. Extracted:`, extractedData);
                 break;
             }
         }
@@ -50,10 +49,14 @@ function processLatestRound(durationMs) {
                 origin: window.location.origin
             };
 
-            console.log("[Forensic Logger] Sending payload to background...", payload);
-            chrome.runtime.sendMessage({ type: 'LOG_LLM_ROUND', payload: payload });
-        } else if (!extractedData) {
-            console.log("[Forensic Logger] No module matched or data was null.");
+            if (chrome.runtime && chrome.runtime.id) {
+                // ADDED .catch() to handle the Promise rejection gracefully
+                chrome.runtime.sendMessage({ type: 'LOG_LLM_ROUND', payload: payload })
+                    .catch(e => {
+                        console.log("[Forensic Logger] Extension context invalidated. Please refresh the page.");
+                        observer.disconnect(); // Stop observing to prevent spam
+                    });
+            }
         }
     } catch (error) {
         console.error('[Forensic Logger] Error processing round:', error);
@@ -61,3 +64,27 @@ function processLatestRound(durationMs) {
         isLogging = false;
     }
 }
+
+// Listen for manual bulk extraction from the popup
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === 'BULK_LOG_REQUEST') {
+        console.log("[Forensic Logger] Received bulk log request.");
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path) && mod.bulkExtract) {
+                const allRounds = mod.bulkExtract();
+                console.log(`[Forensic Logger] Found ${allRounds.length} rounds. Sending to background...`);
+                
+                chrome.runtime.sendMessage({ type: 'BULK_LOG_SESSION', payload: allRounds })
+                    .catch(e => console.error("[Forensic Logger] Failed to send bulk log:", e));
+                sendResponse({ status: 'success' });
+                return true;
+            }
+        }
+        sendResponse({ status: 'no_module_matched' });
+    }
+    return true;
+});

@@ -3,8 +3,27 @@ console.log("[Forensic Logger] New background.js loaded successfully. If you see
 const sessionState = {};
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'LOG_LLM_ROUND') {
-    logRound(message.payload, sender.tab.id);
+  if (message.type === 'BULK_LOG_SESSION') {
+    const rounds = message.payload;
+    console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
+    
+    // Process each round sequentially
+    rounds.forEach((roundData, index) => {
+      // We add a slight delay (200ms) between downloads so Chrome doesn't block 
+      // them as "multiple automatic downloads"
+      setTimeout(() => {
+        const payload = {
+          prompt: roundData.promptText,
+          thinking: roundData.thinkingText || "",
+          response: roundData.responseText,
+          generationDurationMs: 0, // Unknown for historical sessions
+          domNodeCount: 0,         // Not relevant for historical
+          origin: sender.tab ? sender.tab.url : 'unknown'
+        };
+        logRound(payload, sender.tab.id);
+      }, index * 200); 
+    });
+    
     sendResponse({ status: 'success' });
   }
   return true;
