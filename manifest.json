@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "LLM Forensic Logger",
-  "version": "1.0",
-  "description": "Logs LLM chat rounds to local filesystem as MD and JSON.",
+  "version": "1.2",
+  "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
   "permissions": [
     "downloads",
     "storage",
@@ -11,7 +11,12 @@
   ],
   "host_permissions": [
     "*://chatgpt.com/*",
-    "*://claude.ai/*"
+    "*://claude.ai/*",
+    "*://gemini.google.com/*",
+    "*://notebooklm.google.com/*",
+    "*://duck.ai/*",
+    "*://www.google.com/search*",
+    "*://labs.google/fx/tools/flow*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -22,7 +27,15 @@
   "options_page": "options.html",
   "content_scripts": [
     {
-      "matches": ["*://chatgpt.com/*", "*://claude.ai/*"],
+      "matches": [
+        "*://chatgpt.com/*",
+        "*://claude.ai/*",
+        "*://gemini.google.com/*",
+        "*://notebooklm.google.com/*",
+        "*://duck.ai/*",
+        "*://www.google.com/search*",
+        "*://labs.google/fx/tools/flow*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

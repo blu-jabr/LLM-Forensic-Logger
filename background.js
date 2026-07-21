@@ -41,7 +41,9 @@ async function logRound(payload, tabId) {
 
   // Base filename
   const baseFilename = `flush.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
-  const folderPath = `${dateStr}/`; // Saves in Downloads/YYYY-MM-DD/
+  
+  // MODIFIED: Added LLM-Forensic-Logger parent directory
+  const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
 
   // 1. Create Markdown content
   const mdContent = createMarkdown(payload, state.SESSION_ID, roundNum);
@@ -68,16 +70,16 @@ async function logRound(payload, tabId) {
 }
 
 function createMarkdown(payload, sessionId, roundNum) {
-  let md = `# LLM Forensic Log\n\n`;
+  let md = `# AI Forensic Log\n\n`;
   md += `**Session ID:** ${sessionId}\n`;
   md += `**Round:** ${roundNum}\n\n`;
   md += `## User Prompt\n\n${payload.prompt}\n\n`;
   
   if (payload.thinking && payload.thinking.trim().length > 0) {
-    md += `## LLM Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
+    md += `## AI Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
   }
   
-  md += `## LLM Response\n\n${payload.response}\n`;
+  md += `## AI Response\n\n${payload.response}\n`;
   return md;
 }
 
