@@ -1,3 +1,4 @@
+console.log("[Forensic Logger] New background.js loaded successfully. If you see this, the cache is cleared.");
 // Keep track of sessions and sequence numbers in memory
 const sessionState = {};
 
@@ -41,19 +42,16 @@ async function logRound(payload, tabId) {
 
   // Base filename
   const baseFilename = `flush.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
-  
-  // MODIFIED: Added LLM-Forensic-Logger parent directory
   const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
 
   // 1. Create Markdown content
   const mdContent = createMarkdown(payload, state.SESSION_ID, roundNum);
-  const mdBlob = new Blob([mdContent], { type: 'text/markdown' });
-  const mdUrl = URL.createObjectURL(mdBlob);
+  // MV3 Service Workers can't use Blob URLs, so we use a data: URI
+  const mdUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(mdContent);
 
   // 2. Create JSON Metadata content
   const jsonContent = createJsonMetadata(payload, state.SESSION_ID, roundNum, dateStr, timeStr, HOSTNAME);
-  const jsonBlob = new Blob([JSON.stringify(jsonContent, null, 2)], { type: 'application/json' });
-  const jsonUrl = URL.createObjectURL(jsonBlob);
+  const jsonUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(jsonContent, null, 2));
 
   // Trigger Downloads
   chrome.downloads.download({
@@ -84,11 +82,9 @@ function createMarkdown(payload, sessionId, roundNum) {
 }
 
 function createJsonMetadata(payload, sessionId, roundNum, dateStr, timeStr, hostname) {
-  // Forensic metrics
   const responseWords = payload.response.split(/\s+/).length;
   const promptWords = payload.prompt.split(/\s+/).length;
   
-  // Heuristic drift/hallucination indicators (basic)
   const hedgingWords = (payload.response.match(/\b(might be|could be|possibly|perhaps|assuming|I think|likely)\b/gi) || []).length;
   const selfCorrections = (payload.response.match(/\b(Actually|Wait|Correction|I apologize|I made a mistake)\b/gi) || []).length;
 
@@ -123,5 +119,5 @@ function calculateLexicalDiversity(text) {
   const words = text.toLowerCase().match(/\b(\w+)\b/g) || [];
   if (words.length === 0) return 0;
   const uniqueWords = new Set(words);
-  return uniqueWords.size / words.length; // Type-Token Ratio
+  return uniqueWords.size / words.length;
 }
