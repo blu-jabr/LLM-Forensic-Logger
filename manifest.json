@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LLM Forensic Logger",
-  "version": "1.5",
+  "version": "1.6",
   "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
   "permissions": [
     "downloads",
@@ -11,12 +11,14 @@
   ],
   "host_permissions": [
     "*://chatgpt.com/*",
+    "*://chat.openai.com/*",
     "*://claude.ai/*",
-    "*://gemini.google.com/*",
-    "*://notebooklm.google.com/*",
     "*://duck.ai/*",
+    "*://gemini.google.com/*",
+    "*://*.googleusercontent.com/*",
+    "*://labs.google/fx/tools/flow*",
     "*://www.google.com/search*",
-    "*://labs.google/fx/tools/flow*"
+    "*://notebooklm.google.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -30,22 +32,24 @@
     {
       "matches": [
         "*://chatgpt.com/*",
+        "*://chat.openai.com/*",
         "*://claude.ai/*",
-        "*://gemini.google.com/*",
-        "*://notebooklm.google.com/*",
         "*://duck.ai/*",
+        "*://gemini.google.com/*",
+        "*://*.googleusercontent.com/*",
+        "*://labs.google/fx/tools/flow*",
         "*://www.google.com/search*",
-        "*://labs.google/fx/tools/flow*"
+        "*://notebooklm.google.com/*"
       ],
       "js": [
         "modules/index.js",
         "modules/chatgpt.js",
         "modules/claude.js",
-        "modules/gemini.js",
-        "modules/notebooklm.js",
         "modules/duckai.js",
-        "modules/google_search.js",
+        "modules/gemini.js",
         "modules/google_flow.js",
+        "modules/google_search.js",
+        "modules/notebooklm.js",
         "content.js"
       ],
       "run_at": "document_idle"
