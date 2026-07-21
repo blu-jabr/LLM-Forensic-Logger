@@ -1,3 +1,7 @@
+// @match *://chatgpt.com/*
+// @match *://chat.openai.com/*
+// @host_permissions *://chatgpt.com/*
+// @host_permissions *://chat.openai.com/*
 (function() {
     const match = (host, path) => host.includes('chatgpt.com') || host.includes('chat.openai.com');
     const extract = () => {

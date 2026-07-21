@@ -1,3 +1,5 @@
+// @match *://gemini.google.com/*
+// @host_permissions *://gemini.google.com/*
 (function() {
     const match = (host, path) => host.includes('gemini.google.com');
     const extract = () => {

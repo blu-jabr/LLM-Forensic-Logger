@@ -1,3 +1,5 @@
+// @match *://duck.ai/*
+// @host_permissions *://duck.ai/*
 (function() {
     const match = (host, path) => host.includes('duck.ai');
     const extract = () => {

@@ -1,3 +1,5 @@
+// @match *://claude.ai/*
+// @host_permissions *://claude.ai/*
 (function() {
     const match = (host, path) => host.includes('claude.ai');
     const extract = () => {

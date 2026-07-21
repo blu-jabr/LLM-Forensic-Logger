@@ -1,3 +1,5 @@
+// @match *://labs.google/*
+// @host_permissions *://labs.google/*
 (function() {
     const match = (host, path) => host.includes('labs.google') && path.includes('fx/tools/flow');
     const extract = () => {

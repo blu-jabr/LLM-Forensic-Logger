@@ -1,3 +1,5 @@
+// @host  *://google.com/*
+// @host_permissions  *://google.com/*
 (function() {
     const match = (host, path) => host.includes('google.com') && path.includes('/search');
     const extract = () => {

@@ -1,3 +1,5 @@
+// @host *://notebooklm.google.com/*
+// @host_permissions *://notebooklm.google.com/*
 (function() {
     const match = (host, path) => host.includes('notebooklm.google.com');
     const extract = () => {
