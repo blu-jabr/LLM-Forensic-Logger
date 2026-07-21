@@ -4,67 +4,68 @@
 // @host_permissions *://*.googleusercontent.com/*
 (function() {
     const match = (host, path) => host.includes('gemini.google.com');
-    
+
+    // Used for the Markdown file (strips UI buttons)
     const cleanNode = (node) => {
+        if (!node) return "";
         const clone = node.cloneNode(true);
-        
-        // Safely remove ONLY specific UI action buttons, preserving file icons and images
         clone.querySelectorAll('button[aria-label="Copy"], button[aria-label="Listen"], button[aria-label="Share"], button[aria-label="Edit"], button[aria-label="Good response"], button[aria-label="Bad response"], button[aria-label="Generate more"]').forEach(el => el.remove());
-        
-        return clone.innerHTML;
+        return clone.outerHTML || clone.innerHTML; 
+    };
+
+    // Used for the XHTML file (ZERO modifications, preserves original URLs)
+    const rawClone = (node) => {
+        if (!node) return "";
+        return node.cloneNode(true).outerHTML;
+    };
+
+    const getTurns = () => {
+        let turns = document.querySelectorAll('infinite-scroller > div');
+        if (turns.length === 0) turns = document.querySelectorAll('.conversation-container');
+        if (turns.length === 0) {
+            const userEls = document.querySelectorAll('user-query');
+            const modelEls = document.querySelectorAll('model-response');
+            turns = [];
+            const max = Math.max(userEls.length, modelEls.length);
+            for (let i = 0; i < max; i++) {
+                const div = document.createElement('div');
+                if (userEls[i]) div.appendChild(userEls[i].cloneNode(true));
+                if (modelEls[i]) div.appendChild(modelEls[i].cloneNode(true));
+                turns.push(div);
+            }
+        }
+        return Array.from(turns);
     };
 
     const extract = () => {
-        const userElements = document.querySelectorAll('user-query-content');
-        const modelElements = document.querySelectorAll('message-content');
-        
-        const effectiveUserEls = userElements.length > 0 ? userElements : document.querySelectorAll('user-query, .query-text');
-        const effectiveModelEls = modelElements.length > 0 ? modelElements : document.querySelectorAll('model-response, .model-response-text, .response-container');
+        const turns = getTurns();
+        const lastTurn = turns[turns.length - 1];
+        if (!lastTurn) return null;
 
-        const lastUserMsg = effectiveUserEls[effectiveUserEls.length - 1];
-        const lastModelMsg = effectiveModelEls[effectiveModelEls.length - 1];
+        const userEl = lastTurn.querySelector('user-query-content, user-query, .query-text');
+        const modelEl = lastTurn.querySelector('message-content, model-response, .response-container');
 
-        if (!lastUserMsg || !lastModelMsg) return null;
-
-        const promptHtml = cleanNode(lastUserMsg);
-        let thinkingHtml = "";
-        
-        const thinkingElement = lastModelMsg.querySelector('[class*="thought"], [class*="reasoning"]');
-        if (thinkingElement) {
-            thinkingHtml = cleanNode(thinkingElement);
-            thinkingElement.remove();
-        }
-        const responseHtml = cleanNode(lastModelMsg);
-
-        return { promptHtml, thinkingHtml, responseHtml };
+        return {
+            promptHtml: cleanNode(userEl),
+            thinkingHtml: "",
+            responseHtml: cleanNode(modelEl),
+            roundHtml: rawClone(lastTurn) // Pristine snapshot for XHTML
+        };
     };
 
     const bulkExtract = () => {
-        const userElements = document.querySelectorAll('user-query-content');
-        const modelElements = document.querySelectorAll('message-content');
-        
-        const effectiveUserEls = userElements.length > 0 ? userElements : document.querySelectorAll('user-query, .query-text');
-        const effectiveModelEls = modelElements.length > 0 ? modelElements : document.querySelectorAll('model-response, .model-response-text, .response-container');
-
+        const turns = getTurns();
         const rounds = [];
-        const maxRounds = Math.max(effectiveUserEls.length, effectiveModelEls.length);
-        
-        for (let i = 0; i < maxRounds; i++) {
-            let promptHtml = "";
-            let thinkingHtml = "";
-            let responseHtml = "";
+        for (let turn of turns) {
+            const userEl = turn.querySelector('user-query-content, user-query, .query-text');
+            const modelEl = turn.querySelector('message-content, model-response, .response-container');
 
-            if (effectiveUserEls[i]) promptHtml = cleanNode(effectiveUserEls[i]);
-            if (effectiveModelEls[i]) {
-                const thinkingElement = effectiveModelEls[i].querySelector('[class*="thought"], [class*="reasoning"]');
-                if (thinkingElement) {
-                    thinkingHtml = cleanNode(thinkingElement);
-                }
-                responseHtml = cleanNode(effectiveModelEls[i]);
-            }
+            const promptHtml = cleanNode(userEl);
+            const responseHtml = cleanNode(modelEl);
+            const roundHtml = rawClone(turn); // Pristine snapshot for XHTML
 
-            if (promptHtml || responseHtml) {
-                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            if (promptHtml || responseHtml || roundHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml, roundHtml });
             }
         }
         return rounds;

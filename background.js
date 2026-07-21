@@ -15,6 +15,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           thinking: roundData.thinking || "",
           response: roundData.response,
           mediaFiles: roundData.mediaFiles || [],
+          roundHtml: roundData.roundHtml || "",  
           generationDurationMs: 0,
           domNodeCount: 0,
           origin: sender.tab ? sender.tab.url : 'unknown'
@@ -48,30 +49,30 @@ async function logRound(payload, tabId) {
   const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
   const mediaDirName = `${baseFilename}.d`;
 
-  // Replace the placeholder in the markdown with the actual directory name
-  const finalPrompt = payload.prompt.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
-  const finalThinking = payload.thinking.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
-  const finalResponse = payload.response.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
-
   // 1. Create Markdown content
-  const mdContent = createMarkdown(finalPrompt, finalThinking, finalResponse, state.SESSION_ID, roundNum);
+  const mdContentRaw = createMarkdown(payload, state.SESSION_ID, roundNum);
+  const mdContent = mdContentRaw.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
   const mdUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(mdContent);
 
   // 2. Create JSON Metadata content
   const jsonContent = createJsonMetadata(payload, state.SESSION_ID, roundNum, dateStr, timeStr, HOSTNAME);
   const jsonUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(jsonContent, null, 2));
 
-  // Trigger Downloads for MD and JSON
+  // 3. Create XHTML Raw DOM Snapshot
+  const xhtmlContent = `<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="UTF-8"/><title>Round ${roundNum}</title></head><body>${payload.roundHtml || ""}</body></html>`;
+  const finalXhtmlContent = xhtmlContent.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const xhtmlUrl = 'data:application/xhtml+xml;charset=utf-8,' + encodeURIComponent(finalXhtmlContent);
+
+  // Trigger Downloads for MD, JSON, and XHTML
   chrome.downloads.download({ url: mdUrl, filename: `${folderPath}${baseFilename}.md`, saveAs: false });
   chrome.downloads.download({ url: jsonUrl, filename: `${folderPath}${baseFilename}.json`, saveAs: false });
+  chrome.downloads.download({ url: xhtmlUrl, filename: `${folderPath}${baseFilename}.xhtml`, saveAs: false });
 
-  // 3. Trigger Downloads for Media Files
+  // 4. Trigger Downloads for Media Files
   if (payload.mediaFiles && payload.mediaFiles.length > 0) {
     payload.mediaFiles.forEach((media, idx) => {
       setTimeout(() => {
-        // Use directUrl if available (bypasses page CSP), otherwise use dataUrl (for blobs)
         const downloadUrl = media.directUrl || media.dataUrl;
-        
         if (downloadUrl) {
           chrome.downloads.download({
             url: downloadUrl,
@@ -79,20 +80,22 @@ async function logRound(payload, tabId) {
             saveAs: false
           });
         }
-      }, idx * 200); // Stagger media downloads by 200ms
+      }, idx * 200);
     });
   }
 }
 
-function createMarkdown(prompt, thinking, response, sessionId, roundNum) {
+function createMarkdown(payload, sessionId, roundNum) {
   let md = `# AI Forensic Log\n\n`;
   md += `**Session ID:** ${sessionId}\n`;
   md += `**Round:** ${roundNum}\n\n`;
-  md += `## User Prompt\n\n${prompt}\n\n`;
-  if (thinking && thinking.trim().length > 0) {
-    md += `## AI Thinking\n\n\`\`\`\n${thinking}\n\`\`\`\n\n`;
+  md += `## User Prompt\n\n${payload.prompt}\n\n`;
+
+  if (payload.thinking && payload.thinking.trim().length > 0) {
+    md += `## AI Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
   }
-  md += `## AI Response\n\n${response}\n`;
+  
+  md += `## AI Response\n\n${payload.response}\n`;
   return md;
 }
 

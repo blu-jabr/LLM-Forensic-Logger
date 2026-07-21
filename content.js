@@ -1,25 +1,3 @@
-// HACK: Prevent aggressive SPAs from clearing our debug logs
-window.console.clear = () => { console.log('[Forensic Logger] Prevented console.clear()'); };
-
-let isLogging = false;
-let lastLoggedPromptText = "";
-let debounceTimer = null;
-let streamStartTime = 0;
-
-const observer = new MutationObserver((mutations) => {
-    if (isLogging) return;
-    if (streamStartTime === 0) streamStartTime = Date.now();
-
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-        const duration = Date.now() - streamStartTime;
-        streamStartTime = 0;
-        processLatestRound(duration);
-    }, 1500);
-});
-
-observer.observe(document.body, { childList: true, subtree: true });
-
 async function processLatestRound(durationMs) {
     if (isLogging) return;
     isLogging = true;
@@ -38,21 +16,20 @@ async function processLatestRound(durationMs) {
         }
 
         if (extractedData && extractedData.promptHtml) {
-            // Use the raw HTML as the uniqueness check
             if (extractedData.promptHtml === lastLoggedPromptText) {
                 isLogging = false;
                 return;
             }
             lastLoggedPromptText = extractedData.promptHtml;
             
-            // Process HTML into Markdown and fetch media
-            const { markdown, mediaFiles } = await processHtmlAndMedia(extractedData);
+            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(extractedData);
             
             const payload = {
                 prompt: markdown.prompt,
                 thinking: markdown.thinking,
                 response: markdown.response,
                 mediaFiles: mediaFiles,
+                roundHtml: roundHtml,
                 generationDurationMs: durationMs,
                 domNodeCount: document.getElementsByTagName('*').length,
                 origin: window.location.origin
@@ -89,12 +66,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     
                     const processedRounds = [];
                     for (const round of allRounds) {
-                        const { markdown, mediaFiles } = await processHtmlAndMedia(round);
+                        const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(round);
                         processedRounds.push({
                             prompt: markdown.prompt,
                             thinking: markdown.thinking,
                             response: markdown.response,
-                            mediaFiles: mediaFiles
+                            mediaFiles: mediaFiles,
+                            roundHtml: roundHtml
                         });
                     }
                     
@@ -102,7 +80,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         .catch(e => console.error("[Forensic Logger] Failed to send bulk log:", e));
                     sendResponse({ status: 'success' });
                 })();
-                return true; // Keep channel open for async
+                return true; 
             }
         }
         sendResponse({ status: 'no_module_matched' });
@@ -112,21 +90,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // --- HTML to Markdown & Media Extraction Engine ---
 
-async function processHtmlAndMedia(data, showAttachmentHtml) {
+async function processHtmlAndMedia(data) {
     let mediaFiles = [];
-    let attachments = [];
+    let mediaIndex = 0;
+    let attachmentIndex = 0;
     
     const processHtml = async (htmlString, isPromptSection) => {
-        if (!htmlString) return "";
+        if (!htmlString) return { md: "", html: "" };
         const doc = new DOMParser().parseFromString(htmlString, 'text/html');
         
-        // Convert to static array to prevent issues when modifying DOM during loop
         const mediaElements = Array.from(doc.querySelectorAll('img, video, a[href][download], a[href], [style*="background-image"]'));
-        let mediaIndex = 0;
-        let attachmentIndex = 0;
 
         for (let el of mediaElements) {
-            // Skip if element was already removed from DOM by a previous replacement
             if (!el.closest('body')) continue;
 
             let url = el.src || el.href || el.dataset.src;
@@ -142,9 +117,7 @@ async function processHtmlAndMedia(data, showAttachmentHtml) {
 
             if (!url || url.startsWith('data:') || url.startsWith('javascript:')) continue;
 
-            // Ignore standard navigation links ONLY in the AI response
             if (!isPromptSection && el.tagName === 'A' && !el.hasAttribute('download') && !url.match(/\.(png|jpg|jpeg|gif|pdf|mp4|webm|csv|webp|svg)$/i)) {
-                el.outerHTML = `[${el.innerText}](${url})`;
                 continue;
             }
 
@@ -182,16 +155,11 @@ async function processHtmlAndMedia(data, showAttachmentHtml) {
                     }
                 }
 
-                // Determine if this is an attachment based on context
                 let isAttachment = false;
                 if (isPromptSection) {
-                    // Everything in the user prompt is an attachment
                     isAttachment = true;
                 } else {
-                    // In the AI response, only explicit download links are attachments
-                    if (el.tagName === 'A' && el.hasAttribute('download')) {
-                        isAttachment = true;
-                    }
+                    if (el.tagName === 'A' && el.hasAttribute('download')) isAttachment = true;
                 }
 
                 let filename = "";
@@ -215,60 +183,56 @@ async function processHtmlAndMedia(data, showAttachmentHtml) {
                     }
                 }
 
-                // Capture container HTML for attachments
-                if (isAttachment) {
-                    let containerHtml = "";
-                    if (showAttachmentHtml) {
-                        // Grab the immediate parent container's HTML
-                        let container = el.parentElement;
-                        if (container) {
-                            containerHtml = container.outerHTML;
-                        } else {
-                            containerHtml = el.outerHTML;
-                        }
-                    }
-                    attachments.push({ filename, containerHtml });
-                }
-
                 if (isBlob) {
                     mediaFiles.push({ filename, dataUrl });
                 } else {
                     mediaFiles.push({ filename, directUrl: url });
                 }
 
-                // Rewrite the HTML to point to the local file
+                // Rewrite src/href to point to the local file (preserves HTML structure for .xhtml)
                 if (el.tagName === 'IMG' || el.tagName === 'VIDEO') {
-                    el.outerHTML = `\n![${filename}](flush.MEDIA_PLACEHOLDER/${filename})\n`;
-                } else {
-                    el.outerHTML = `\n[Attachment: ${filename}](flush.MEDIA_PLACEHOLDER/${filename})\n`;
+                    el.setAttribute('src', `flush.MEDIA_PLACEHOLDER/${filename}`);
+                    el.removeAttribute('srcset');
+                } else if (el.tagName === 'A') {
+                    el.setAttribute('href', `flush.MEDIA_PLACEHOLDER/${filename}`);
                 }
             } catch (e) {
                 console.error("[Forensic Logger] Failed to process media:", url, e);
-                if (el.tagName === 'IMG' || el.tagName === 'VIDEO') {
-                    el.outerHTML = `\n[Media failed to download (CORS/CSP blocked): ${url}](${url})\n`;
-                } else {
-                    el.outerHTML = `\n[Attachment failed to download: ${url}](${url})\n`;
-                }
             }
         }
 
-        return convertHtmlToMarkdown(doc.body.innerHTML);
+        return { 
+            md: convertHtmlToMarkdown(doc.body.innerHTML), 
+            html: doc.body.innerHTML 
+        };
     };
 
-    // Pass true for isPromptSection when processing the prompt, false otherwise
-    const promptMd = await processHtml(data.promptHtml, true);
-    const thinkingMd = await processHtml(data.thinkingHtml, false);
-    const responseMd = await processHtml(data.responseHtml, false);
+    const promptRes = await processHtml(data.promptHtml, true);
+    const thinkingRes = await processHtml(data.thinkingHtml, false);
+    const responseRes = await processHtml(data.responseHtml, false);
+
+    let finalRoundHtml = "";
+    if (data.roundHtml) {
+        // Pass the pristine HTML directly to the background script.
+        // Do NOT run the media fetcher on it, preserving original URLs.
+        finalRoundHtml = data.roundHtml;
+    } else {
+        // Fallback for modules that don't provide a full roundHtml
+        finalRoundHtml = `
+            <div class="forensic-user-prompt">${promptRes.html}</div>
+            <div class="forensic-ai-thinking">${thinkingRes.html}</div>
+            <div class="forensic-ai-response">${responseRes.html}</div>
+        `;
+    }
 
     return { 
-        markdown: { prompt: promptMd, thinking: thinkingMd, response: responseMd }, 
+        markdown: { prompt: promptRes.md, thinking: thinkingRes.md, response: responseRes.md }, 
         mediaFiles,
-        attachments
+        roundHtml: finalRoundHtml
     };
 }
 
 function convertHtmlToMarkdown(html) {
-    // (Keep your existing convertHtmlToMarkdown function exactly as it is)
     let md = html;
     md = md.replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (m, c) => `\n\`\`\`\n${c}\n\`\`\`\n`);
     md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (m, c) => `\`${c}\``);
@@ -279,6 +243,8 @@ function convertHtmlToMarkdown(html) {
     md = md.replace(/<h3[^>]*>(.*?)<\/h3>/gi, '\n### $1\n');
     md = md.replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n');
     md = md.replace(/<\/?(ul|ol)[^>]*>/gi, '\n');
+    md = md.replace(/<img[^>]*src="(.*?)"[^>]*>/gi, '\n![]($1)\n');
+    md = md.replace(/<video[^>]*src="(.*?)"[^>]*>.*?<\/video>/gi, '\n[Video]($1)\n');
     md = md.replace(/<a[^>]*href="(.*?)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)');
     md = md.replace(/<br\s*\/?>/gi, '\n');
     md = md.replace(/<p[^>]*>(.*?)<\/p>/gi, '\n$1\n');
