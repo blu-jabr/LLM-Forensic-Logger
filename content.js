@@ -1,3 +1,32 @@
+// HACK: Prevent aggressive SPAs from clearing our debug logs
+window.console.clear = () => { console.log('[Forensic Logger] Prevented console.clear()'); };
+
+let isLogging = false;
+let isBulkLogging = false; // Prevents live logger from firing during bulk extraction
+let lastLoggedPromptText = "";
+let debounceTimer = null;
+let streamStartTime = 0;
+
+const observer = new MutationObserver((mutations) => {
+    if (isLogging || isBulkLogging) return;
+    if (streamStartTime === 0) streamStartTime = Date.now();
+
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        const duration = Date.now() - streamStartTime;
+        streamStartTime = 0;
+        processLatestRound(duration);
+    }, 1500);
+});
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
 async function processLatestRound(durationMs) {
     if (isLogging) return;
     isLogging = true;
@@ -6,11 +35,13 @@ async function processLatestRound(durationMs) {
         const host = window.location.hostname;
         const path = window.location.pathname;
         let extractedData = null;
+        let matchedModuleName = "";
 
         for (const moduleName in window.ForensicModules) {
             const mod = window.ForensicModules[moduleName];
             if (mod.match(host, path)) {
                 extractedData = mod.extract();
+                matchedModuleName = moduleName;
                 break;
             }
         }
@@ -24,12 +55,17 @@ async function processLatestRound(durationMs) {
             
             const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(extractedData);
             
+            const mod = window.ForensicModules[matchedModuleName];
+            const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+            
             const payload = {
                 prompt: markdown.prompt,
                 thinking: markdown.thinking,
                 response: markdown.response,
                 mediaFiles: mediaFiles,
                 roundHtml: roundHtml,
+                sessionName: sessionName,
+                metadata: extractedData.metadata || {},
                 generationDurationMs: durationMs,
                 domNodeCount: document.getElementsByTagName('*').length,
                 origin: window.location.origin
@@ -53,6 +89,7 @@ async function processLatestRound(durationMs) {
 // Listen for manual bulk extraction
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.type === 'BULK_LOG_REQUEST') {
+        isBulkLogging = true; // Pause live logging
         console.log("[Forensic Logger] Received bulk log request.");
         const host = window.location.hostname;
         const path = window.location.pathname;
@@ -61,29 +98,45 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const mod = window.ForensicModules[moduleName];
             if (mod.match(host, path) && mod.bulkExtract) {
                 (async () => {
-                    const allRounds = mod.bulkExtract();
-                    console.log(`[Forensic Logger] Found ${allRounds.length} rounds. Processing media...`);
-                    
-                    const processedRounds = [];
-                    for (const round of allRounds) {
-                        const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(round);
-                        processedRounds.push({
-                            prompt: markdown.prompt,
-                            thinking: markdown.thinking,
-                            response: markdown.response,
-                            mediaFiles: mediaFiles,
-                            roundHtml: roundHtml
+                    try {
+                        const allRounds = mod.bulkExtract();
+                        console.log(`[Forensic Logger] Found ${allRounds.length} rounds. Processing media...`);
+                        
+                        const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+                        
+                        const processedRounds = [];
+                        for (const round of allRounds) {
+                            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(round);
+                            processedRounds.push({
+                                prompt: markdown.prompt,
+                                thinking: markdown.thinking,
+                                response: markdown.response,
+                                mediaFiles: mediaFiles,
+                                roundHtml: roundHtml,
+                                metadata: round.metadata || {}
+                            });
+                        }
+                        
+                        await chrome.runtime.sendMessage({ 
+                            type: 'BULK_LOG_SESSION', 
+                            payload: {
+                                rounds: processedRounds,
+                                sessionName: sessionName
+                            }
                         });
+                        sendResponse({ status: 'success' });
+                    } catch (e) {
+                        console.error("[Forensic Logger] Bulk log failed:", e);
+                        sendResponse({ status: 'error', error: e.message });
+                    } finally {
+                        isBulkLogging = false; // Resume live logging
                     }
-                    
-                    chrome.runtime.sendMessage({ type: 'BULK_LOG_SESSION', payload: processedRounds })
-                        .catch(e => console.error("[Forensic Logger] Failed to send bulk log:", e));
-                    sendResponse({ status: 'success' });
                 })();
                 return true; 
             }
         }
         sendResponse({ status: 'no_module_matched' });
+        isBulkLogging = false;
     }
     return true;
 });
@@ -189,7 +242,6 @@ async function processHtmlAndMedia(data) {
                     mediaFiles.push({ filename, directUrl: url });
                 }
 
-                // Rewrite src/href to point to the local file (preserves HTML structure for .xhtml)
                 if (el.tagName === 'IMG' || el.tagName === 'VIDEO') {
                     el.setAttribute('src', `flush.MEDIA_PLACEHOLDER/${filename}`);
                     el.removeAttribute('srcset');
@@ -213,11 +265,8 @@ async function processHtmlAndMedia(data) {
 
     let finalRoundHtml = "";
     if (data.roundHtml) {
-        // Pass the pristine HTML directly to the background script.
-        // Do NOT run the media fetcher on it, preserving original URLs.
         finalRoundHtml = data.roundHtml;
     } else {
-        // Fallback for modules that don't provide a full roundHtml
         finalRoundHtml = `
             <div class="forensic-user-prompt">${promptRes.html}</div>
             <div class="forensic-ai-thinking">${thinkingRes.html}</div>
