@@ -1,44 +1,81 @@
 console.log("[Forensic Logger] New background.js loaded successfully.");
 
-const sessionState = {};
+let isProcessing = false;
+const logQueue = [];
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'LOG_LLM_ROUND') {
-    logRound(message.payload, sender.tab.id);
+    logQueue.push({ payload: message.payload, isBulk: false });
+    processQueue();
     sendResponse({ status: 'success' });
   } else if (message.type === 'BULK_LOG_SESSION') {
-    const { rounds, sessionName } = message.payload;
+    const { rounds, sessionName, chatId } = message.payload;
     console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
     
-    rounds.forEach((roundData, index) => {
-      setTimeout(() => {
-        const payload = {
-          prompt: roundData.prompt,
-          thinking: roundData.thinking || "",
-          response: roundData.response,
-          mediaFiles: roundData.mediaFiles || [],
-          roundHtml: roundData.roundHtml || "",
-          sessionName: sessionName || "Untitled Session",
-          metadata: roundData.metadata || {},
-          generationDurationMs: 0,
-          domNodeCount: 0,
-          origin: sender.tab ? sender.tab.url : 'unknown'
-        };
-        logRound(payload, sender.tab.id);
-      }, index * 500); 
-    });
+    // ADD THIS: Reset the sequence number for this chat to 0 before queueing
+    if (chatId) {
+      getSessionState(chatId, true).then(() => {
+        rounds.forEach((roundData) => {
+          const payload = {
+            prompt: roundData.prompt,
+            thinking: roundData.thinking || "",
+            response: roundData.response,
+            mediaFiles: roundData.mediaFiles || [],
+            roundHtml: roundData.roundHtml || "",
+            sessionName: sessionName || "Untitled Session",
+            metadata: roundData.metadata || {},
+            chatId: chatId, // Pass chatId in payload
+            generationDurationMs: 0,
+            domNodeCount: 0,
+            origin: sender.tab ? sender.tab.url : 'unknown'
+          };
+          logQueue.push({ payload, isBulk: true });
+        });
+        processQueue();
+      });
+    }
     sendResponse({ status: 'success' });
   }
   return true;
 });
 
-async function logRound(payload, tabId) {
-  if (!sessionState[tabId]) {
-    sessionState[tabId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
-  }
+async function processQueue() {
+  if (isProcessing || logQueue.length === 0) return;
+  isProcessing = true;
 
-  const state = sessionState[tabId];
+  const { payload } = logQueue.shift();
+  await logRound(payload, payload.chatId);
+
+  isProcessing = false;
+  if (logQueue.length > 0) setTimeout(processQueue, 100);
+}
+
+// UPDATED: Added shouldReset parameter
+async function getSessionState(chatId, shouldReset = false) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  
+  if (!sessions[chatId] || shouldReset) {
+    // Generate a NEW Session ID and reset the round number to 0
+    sessions[chatId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
+    await chrome.storage.local.set({ sessions });
+  }
+  
+  return sessions[chatId];
+}
+
+async function saveSessionState(chatId, state) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  sessions[chatId] = state;
+  await chrome.storage.local.set({ sessions });
+}
+
+async function logRound(payload, chatId) {
+  const state = await getSessionState(chatId);
   state.round_number += 1;
+  await saveSessionState(chatId, state);
+
   const roundNum = state.round_number;
   const seqNum = String(roundNum).padStart(8, '0');
 

@@ -2,12 +2,28 @@
 window.console.clear = () => { console.log('[Forensic Logger] Prevented console.clear()'); };
 
 let isLogging = false;
-let isBulkLogging = false; // Prevents live logger from firing during bulk extraction
+let isBulkLogging = false;
 let lastLoggedPromptText = "";
 let debounceTimer = null;
 let streamStartTime = 0;
+let isScrolling = false;
+let scrollTimeout = null;
+const pageLoadTime = Date.now();
+
+// Detect when the user is scrolling so we don't log during virtual DOM shifts
+window.addEventListener('scroll', () => {
+    isScrolling = true;
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(() => { isScrolling = false; }, 1000);
+}, true);
 
 const observer = new MutationObserver((mutations) => {
+    // Ignore mutations during the first 5 seconds of page load
+    if (Date.now() - pageLoadTime < 5000) return;
+    
+    // Ignore mutations while scrolling
+    if (isScrolling) return;
+
     if (isLogging || isBulkLogging) return;
     if (streamStartTime === 0) streamStartTime = Date.now();
 
@@ -18,6 +34,14 @@ const observer = new MutationObserver((mutations) => {
         processLatestRound(duration);
     }, 1500);
 });
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
 
 if (document.body) {
     observer.observe(document.body, { childList: true, subtree: true });
@@ -47,11 +71,13 @@ async function processLatestRound(durationMs) {
         }
 
         if (extractedData && extractedData.promptHtml) {
-            if (extractedData.promptHtml === lastLoggedPromptText) {
+            // Convert HTML to text for a more stable comparison
+            const currentPromptText = extractedData.promptHtml.replace(/<[^>]+>/g, '').trim();
+            if (currentPromptText === lastLoggedPromptText) {
                 isLogging = false;
                 return;
             }
-            lastLoggedPromptText = extractedData.promptHtml;
+            lastLoggedPromptText = currentPromptText;
             
             const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(extractedData);
             
@@ -66,6 +92,7 @@ async function processLatestRound(durationMs) {
                 roundHtml: roundHtml,
                 sessionName: sessionName,
                 metadata: extractedData.metadata || {},
+                chatId: window.location.pathname.split('/').pop(), // ADD THIS
                 generationDurationMs: durationMs,
                 domNodeCount: document.getElementsByTagName('*').length,
                 origin: window.location.origin
@@ -89,8 +116,10 @@ async function processLatestRound(durationMs) {
 // Listen for manual bulk extraction
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.type === 'BULK_LOG_REQUEST') {
-        isBulkLogging = true; // Pause live logging
-        console.log("[Forensic Logger] Received bulk log request.");
+        clearTimeout(debounceTimer); // CRITICAL: Stop the pending live log
+        observer.disconnect();       // CRITICAL: Stop observing DOM changes
+        isBulkLogging = true;
+        console.log("[Forensic Logger] Received bulk log request. Live logging paused.");
         const host = window.location.hostname;
         const path = window.location.pathname;
         
@@ -121,7 +150,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             type: 'BULK_LOG_SESSION', 
                             payload: {
                                 rounds: processedRounds,
-                                sessionName: sessionName
+                                sessionName: sessionName,
+                                chatId: window.location.pathname.split('/').pop() // ADD THIS
                             }
                         });
                         sendResponse({ status: 'success' });
@@ -129,7 +159,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         console.error("[Forensic Logger] Bulk log failed:", e);
                         sendResponse({ status: 'error', error: e.message });
                     } finally {
-                        isBulkLogging = false; // Resume live logging
+                        isBulkLogging = false; 
                     }
                 })();
                 return true; 
@@ -140,7 +170,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     return true;
 });
-
 // --- HTML to Markdown & Media Extraction Engine ---
 
 async function processHtmlAndMedia(data) {

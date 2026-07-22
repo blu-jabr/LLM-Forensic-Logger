@@ -62,30 +62,30 @@
         return metadata;
     };
 
-    // FIX: Filter out garbage UI wrapper divs
+    // FIX: Traverse in strict DOM order, no visual sorting
     const getTurns = () => {
-        let potentialTurns = document.querySelectorAll('infinite-scroller > div, .conversation-container > div');
-        let validTurns = [];
+        const allEls = Array.from(document.querySelectorAll('user-query, model-response'));
+        const validTurns = [];
+        let currentTurn = document.createElement('div');
         
-        potentialTurns.forEach(turn => {
-            // A valid turn MUST contain a user query or a model response
-            if (turn.querySelector('user-query, model-response, .query-text, .response-container')) {
-                validTurns.push(turn);
-            }
-        });
-
-        // Fallback if wrapper structure changed completely
-        if (validTurns.length === 0) {
-            const userEls = document.querySelectorAll('user-query');
-            const modelEls = document.querySelectorAll('model-response');
-            const max = Math.max(userEls.length, modelEls.length);
-            for (let i = 0; i < max; i++) {
-                const div = document.createElement('div');
-                if (userEls[i]) div.appendChild(userEls[i].cloneNode(true));
-                if (modelEls[i]) div.appendChild(modelEls[i].cloneNode(true));
-                validTurns.push(div);
+        for (let el of allEls) {
+            const isUser = el.tagName.toLowerCase() === 'user-query';
+            if (isUser) {
+                // If we already have content, push the previous turn
+                if (currentTurn.children.length > 0) {
+                    validTurns.push(currentTurn);
+                }
+                // Start a new turn
+                currentTurn = document.createElement('div');
+                currentTurn.appendChild(el.cloneNode(true));
+            } else {
+                // It's a model response, add to current turn
+                currentTurn.appendChild(el.cloneNode(true));
             }
         }
+        // Push the final turn
+        if (currentTurn.children.length > 0) validTurns.push(currentTurn);
+        
         return validTurns;
     };
 
