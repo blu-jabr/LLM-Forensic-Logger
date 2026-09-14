@@ -1,0 +1,500 @@
+    const section = document.querySelector('section');
+    if (!section) return false;
+
+    // Count external citation links — only AI responses have these
+    const links = section.querySelectorAll('a[href]');
+    let extCount = 0;
+    for (const link of links) {
+      const href = link.getAttribute('href') || '';
+      if (href.startsWith('http') && !href.includes('google.com')) extCount++;
+      if (href.startsWith('/url?')) extCount++;
+    }
+
+    if (extCount >= 3) return 'content_detected';
+    return false;
+  }
+
+  function parseUrl() {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      query: params.get('q') || '',
+      searchId: params.get('ei') || '',
+      udm: params.get('udm') || '',
+    };
+  }
+
+  // ─── Find the actual AI response area ───
+
+  // ─── AI Chat Thread Detection ───
+
+  // From DOM diagnostic:
+  //   Section: 141K (whole page)
+  //   Main content: 141K, 12 children (search results + chat + sidebar)
+  //   Chat thread: 87K, 4 children (just the AI conversation)
+  //   Search results: 11 smaller containers totaling ~54K
+  //
+  // Strategy: find the div within the section that's in the 50K-100K
+  // range with 2-10 children. That's uniquely the chat thread.
+
+  function findAiChatThread() {
+    const section = document.querySelector('section');
+    if (!section) {
+      for (const c of [document.querySelector('#search'), document.querySelector('#rso'), document.querySelector('main')]) {
+        if (c && c.children.length > 0) return c;
+      }
+      return null;
+    }
+
+    let chatThread = null;
+    let bestLen = 0;
+
+    section.querySelectorAll('div').forEach(el => {
+      const t = (el.textContent || '').trim().length;
+      const c = el.children.length;
+
+      // Chat thread: large text (50K-100K) but not whole page (<120K)
+      // Few children (2-10) — not 12+ like the results container
+      if (t >= 50000 && t < 120000 && c >= 2 && c <= 10) {
+        if (t > bestLen) {
+          bestLen = t;
+          chatThread = el;
+        }
+      }
+    });
+
+    if (chatThread) {
+      console.log(`[${MODULE_NAME}] Found AI chat thread: <${chatThread.tagName}> textLen=${bestLen} children=${chatThread.children.length}`);
+      // Show what the 4 children look like (the chat turns)
+      for (let i = 0; i < Math.min(chatThread.children.length, 8); i++) {
+        const child = chatThread.children[i];
+        const len = (child.textContent || '').trim().length;
+        console.log(`[${MODULE_NAME}]   Turn [${i}]: <${child.tagName}> class="${(child.className||'').substring(0,40)}" textLen=${len} preview="${(child.textContent||'').trim().substring(0,60)}"`);
+      }
+      return chatThread;
+    }
+
+    console.log(`[${MODULE_NAME}] No chat thread found, using section`);
+    return section;
+  }
+
+  function commonAncestor(a, b) {
+    const set = new Set();
+    let n = a;
+    while (n) { set.add(n); n = n.parentElement; }
+    n = b;
+    while (n) { if (set.has(n)) return n; n = n.parentElement; }
+    return null;
+  }
+
+  // ─── Text Extraction ───
+
+  function getCleanText(element) {
+    let result = '';
+    let nodeCount = 0;
+
+    function walk(el) {
+      if (nodeCount > 50000) return;
+      if (SKIP_TAGS.has(el.tagName?.toLowerCase())) return;
+
+      const role = el.getAttribute('role');
+      if (role && /^(navigation|complementary|search|banner|toolbar|tablist)$/.test(role)) return;
+      if (el.getAttribute('aria-hidden') === 'true') return;
+      const ariaLabel = el.getAttribute('aria-label') || '';
+      if (/history|sidebar|close|menu|manage/i.test(ariaLabel)) return;
+
+      for (const child of el.childNodes) {
+        nodeCount++;
+        if (child.nodeType === 3) {
+          const t = child.textContent;
+          if (t && t.trim()) result += t;
+        } else if (child.nodeType === 1) {
+          walk(child);
+        }
+      }
+    }
+
+    walk(element);
+    return result.replace(/\s{2,}/g, ' ').trim();
+  }
+
+  // ─── Citations ───
+
+  function extractCitationsFrom(container) {
+    const citations = [];
+    const seenUrls = new Set();
+    const links = container.querySelectorAll('a[href]');
+    for (const link of links) {
+      const href = link.getAttribute('href') || '';
+      const url = unwrapUrl(href);
+      if (!url || url.includes('google.com')) continue;
+      if (!seenUrls.has(url)) {
+        seenUrls.add(url);
+        citations.push({ title: (link.textContent || '').trim().substring(0, 80), url: url });
+      }
+    }
+    return citations;
+  }
+
+  function unwrapUrl(href) {
+    if (href.startsWith('/url?') || href.startsWith('/aclk')) {
+      try {
+        const params = new URLSearchParams(href.substring(href.indexOf('?')));
+        return decodeURIComponent(params.get('q') || params.get('url') || href);
+      } catch { return href; }
+    }
+    if (href.startsWith('http')) return href;
+    return '';
+  }
+
+  // ─── Save with fallback ───
+
+  function saveData(key, data) {
+    try {
+      if (chrome?.runtime?.id) {
+        chrome.storage.local.set({ [key]: data }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'forensic_log_entry', entry: data }).catch(() => {});
+        return 'extension';
+      }
+    } catch {}
+    try {
+      localStorage.setItem(key, JSON.stringify(data));
+      return 'localStorage';
+    } catch (e) {
+      return 'failed';
+    }
+  }
+
+  // ─── Noise Removal (applied after extraction) ───
+
+  function cleanExtractedText(rawText) {
+    // The sidebar content appears verbatim multiple times.
+    // Real AI content is unique. Strategy: split into segments,
+    // drop duplicates and known UI labels.
+
+    if (rawText.length < 5000) return rawText; // short text is probably clean
+
+    // Split into sentence-level segments
+    const segments = rawText.match(/[^.!?]+[.!?]+/g) || [];
+    if (segments.length === 0) return rawText; // couldn't split, return raw
+
+    const seen = {};
+    const kept = [];
+
+    for (const seg of segments) {
+      const key = seg.trim();
+      if (key.length < 10) {
+        // Skip tiny fragments unless they look like content
+        if (/^\d+$/.test(key) || /^[,;:-]$/.test(key)) continue;
+        kept.push(key);
+        continue;
+      }
+      if (!seen[key]) {
+        seen[key] = 1;
+        kept.push(key);
+      }
+      // Duplicates are dropped (UI chrome repeats, content doesn't)
+    }
+
+    // Remove known UI label strings
+    const uiLabels = [
+      'AI Mode history', 'New thread', 'Close sidebar',
+      'Search threads', 'Manage public links', 'See my AI Mode history',
+      'Copy', 'Share', 'Feedback', 'Expand', 'Collapse',
+      'Open sidebar', 'Close', 'More', 'Report',
+    ];
+
+    const filtered = kept.filter(seg => {
+      const trimmed = seg.trim();
+      return !uiLabels.some(label => trimmed === label || trimmed.startsWith(label + ' '));
+    });
+
+    let cleaned = filtered.join(' ').replace(/\s{2,}/g, ' ').trim();
+
+    // Final pass: remove any remaining long runs of short label-like fragments
+    // (e.g. "New thread Close sidebar Search threads Manage public links")
+    cleaned = cleaned.replace(
+      /(New thread|Close sidebar|Search threads|Manage public links|AI Mode history|See my AI Mode history|Copy|Share|Feedback)[\s]+/gi,
+      ''
+    ).replace(/\s{2,}/g, ' ').trim();
+
+    return cleaned;
+  }
+
+  // ─── Extraction ───
+
+  function extractSession() {
+    console.log(`[${MODULE_NAME}] === EXTRACTION START ===`);
+    const urlData = parseUrl();
+
+    const responseArea = findAiChatThread();
+    if (!responseArea) {
+      console.log(`[${MODULE_NAME}] No response area found`);
+      return null;
+    }
+
+    // Compare section full text vs response area text
+    const section = document.querySelector('section');
+    const sectionLen = section ? getCleanText(section).length : 0;
+
+
+    let rawText = responseArea ? getCleanText(responseArea) : '';
+    console.log(`[${MODULE_NAME}] Response area raw text: ${rawText.length} chars`);
+
+    console.log(`[${MODULE_NAME}] Cleaning UI noise...`);
+    let responseText = cleanExtractedText(rawText);
+    console.log(`[${MODULE_NAME}] Cleaned text: ${responseText.length} chars (removed ${rawText.length - responseText.length})`);
+
+
+    let aiText = getCleanText(responseArea);
+    if (urlData.query && aiText.startsWith(urlData.query)) {
+      aiText = aiText.substring(urlData.query.length).trim();
+    }
+
+    const citations = extractCitationsFrom(responseArea);
+    console.log(`[${MODULE_NAME}] Citations: ${citations.length}`);
+    console.log(`[${MODULE_NAME}] Preview:`, aiText.substring(0, 300));
+
+    const messages = [];
+    if (urlData.query) messages.push({ role: 'user', content: urlData.query, citations: [] });
+    if (aiText) messages.push({ role: 'ai', content: aiText, citations: citations });
+
+    return {
+      module: MODULE_NAME,
+      event_type: 'session_log',
+      timestamp: Date.now(),
+      search_id: urlData.searchId,
+      url: window.location.href,
+      query: urlData.query,
+      udm: urlData.udm,
+      conversation: messages,
+      sources: citations,
+    };
+  }
+
+  // ─── Button ───
+
+  function injectButton() {
+    if (document.getElementById(BUTTON_ID)) return;
+
+    const btn = document.createElement('button');
+    btn.id = BUTTON_ID;
+    btn.textContent = BUTTON_LABEL;
+    btn.style.cssText = `
+      position: fixed; bottom: 20px; right: 20px;
+      padding: 10px 18px; background: #1a73e8; color: white;
+      border: none; border-radius: 8px; font-size: 14px;
+      font-weight: 600; cursor: pointer; z-index: 999999;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    `;
+    btn.addEventListener('mouseenter', () => btn.style.background = '#1557b0');
+    btn.addEventListener('mouseleave', () => btn.style.background = '#1a73e8');
+    btn.addEventListener('click', handleLogClick);
+
+    document.body.appendChild(btn);
+    console.log(`[${MODULE_NAME}] Button injected`);
+  }
+
+  function handleLogClick() {
+    const btn = document.getElementById(BUTTON_ID);
+    btn.textContent = 'Capturing...';
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+
+    try {
+      const sessionData = extractSession();
+
+      if (!sessionData || sessionData.conversation.length === 0) {
+        throw new Error('No AI conversation content found on this page');
+      }
+
+      const aiMsg = sessionData.conversation.find(m => m.role === 'ai');
+      const charCount = aiMsg?.content?.length || 0;
+
+      const key = `search_ai_${sessionData.search_id || 'unknown'}_${sessionData.timestamp}`;
+      const where = saveData(key, sessionData);
+
+      if (where === 'extension') {
+        btn.textContent = `Logged ✓ ${charCount} chars, ${sessionData.sources.length} sources`;
+        btn.style.background = '#34a853';
+      } else if (where === 'localStorage') {
+        btn.textContent = `Saved (localStorage) ✓ ${charCount} chars`;
+        btn.style.background = '#f9a825';
+      } else {
+        btn.textContent = `Captured ${charCount} chars — save failed`;
+        btn.style.background = '#ea4335';
+      }
+
+    } catch (err) {
+      btn.textContent = `Error: ${err.message}`;
+      btn.style.background = '#ea4335';
+      console.log(`[${MODULE_NAME}] FAILED:`, err);
+    }
+
+    setTimeout(() => {
+      btn.textContent = BUTTON_LABEL;
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.style.background = '#1a73e8';
+    }, 5000);
+  }
+
+  // ─── Init ───
+
+  // ─── Init ───
+
+  function init() {
+    console.log(`[${MODULE_NAME}] init() called. URL: ${window.location.href.substring(0, 80)}`);
+
+    const reason = shouldActivate();
+    if (!reason) {
+      console.log(`[${MODULE_NAME}] No AI content detected, skipping`);
+      return;
+    }
+
+    console.log(`[${MODULE_NAME}] AI content detected (${reason})`);
+    injectButton();
+  }
+
+  // Initial run after page settles
+  if (document.readyState === 'complete') {
+    setTimeout(init, 3000);
+  } else {
+    window.addEventListener('load', () => setTimeout(init, 3000));
+  }
+
+  // ─── Persistent re-injection ───
+  // Google's SPA rebuilds the DOM, destroying injected elements.
+  // Periodically check and re-inject if the button disappeared.
+
+  setInterval(() => {
+    if (shouldActivate() && !document.getElementById(BUTTON_ID)) {
+      console.log(`[${MODULE_NAME}] Button lost from DOM, re-injecting`);
+      injectButton();
+    }
+  }, 5000);
+
+  // MutationObserver for late-rendering content — do NOT disconnect
+  let observerRetry = 0;
+  new MutationObserver(() => {
+    if (!document.getElementById(BUTTON_ID) && observerRetry < 30 && shouldActivate()) {
+      observerRetry++;
+      setTimeout(init, 2000);
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/index.js'
+mkdir -p "$(dirname "modules/index.js")"
+rm -f "modules/index.js"
+cat  >> "modules/index.js" << 'EOF_ARCHIVE_CHUNK'
+// Initialize the global namespace for modular LLM handlers
+window.ForensicModules = {};
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/notebooklm.js'
+mkdir -p "$(dirname "modules/notebooklm.js")"
+rm -f "modules/notebooklm.js"
+cat  >> "modules/notebooklm.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://notebooklm.google.com/*
+// @host_permissions *://notebooklm.google.com/*
+(function() {
+    const match = (host, path) => host.includes('notebooklm.google.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.notebooklm = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Payload successfully unpacked.'
+exit 0
+
+```
+
+
+=== modules/chatgpt.js ===
+
+``
+// @match *://chatgpt.com/*
+// @match *://chat.openai.com/*
+// @host_permissions *://chatgpt.com/*
+// @host_permissions *://chat.openai.com/*
+(function() {
+    const match = (host, path) => host.includes('chatgpt.com') || host.includes('chat.openai.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // ChatGPT reasoning/thinking blocks
+        const thinkingElement = lastAssistantMsg.querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove(); 
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+                if (thinkingElement) {

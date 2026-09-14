@@ -1,0 +1,500 @@
+        "*://duck.ai/*",
+        "*://gemini.google.com/*",
+        "*://*.googleusercontent.com/*",
+        "*://labs.google/fx/tools/flow*",
+        "*://www.google.com/search*",
+        "*://*.google.com/search*",
+        "*://notebooklm.google.com/*"
+      ],
+      "js": [
+        "modules/index.js",
+        "modules/chatgpt.js",
+        "modules/claude.js",
+        "modules/duckai.js",
+        "modules/gemini.js",
+        "modules/google_flow.js",
+        "modules/google-search-ai-logger.js",
+        "modules/notebooklm.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: options.html'
+mkdir -p "$(dirname "options.html")"
+rm -f "options.html"
+cat  >> "options.html" << 'EOF_ARCHIVE_CHUNK'
+<!DOCTYPE html>
+<html>
+<head><title>Forensic Logger Settings</title></head>
+<body style="font-family: sans-serif; padding: 20px;">
+  <h2>Forensic Logger Configuration</h2>
+  <p>Since browser extensions cannot run bash commands, please enter your hostname:</p>
+  <label>Hostname (equivalent to <code>uname -n | cut -d. -f1</code>):</label>
+  <input type="text" id="hostname" style="margin-left: 10px;" />
+  <button id="save">Save</button>
+  <p id="status" style="color: green;"></p>
+</body>
+<script src="options.js"></script>
+</html>
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: options.js'
+mkdir -p "$(dirname "options.js")"
+rm -f "options.js"
+cat  >> "options.js" << 'EOF_ARCHIVE_CHUNK'
+document.addEventListener('DOMContentLoaded', () => {
+  chrome.storage.local.get(['hostname'], (result) => {
+    if (result.hostname) {
+      document.getElementById('hostname').value = result.hostname;
+    }
+  });
+
+  document.getElementById('save').addEventListener('click', () => {
+    const hostname = document.getElementById('hostname').value.trim() || 'unknown-host';
+    chrome.storage.local.set({ hostname: hostname }, () => {
+      const status = document.getElementById('status');
+      status.textContent = 'Saved.';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    });
+  });
+});
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: popup.html'
+mkdir -p "$(dirname "popup.html")"
+rm -f "popup.html"
+cat  >> "popup.html" << 'EOF_ARCHIVE_CHUNK'
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 220px; padding: 10px; font-family: sans-serif; }
+    button { width: 100%; padding: 8px; cursor: pointer; margin-bottom: 5px; }
+    .warning { font-size: 11px; color: #555; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <button id="bulkLog">Log Entire Session</button>
+  <p class="warning">Note: For long chats, scroll to the very top of the conversation before clicking this to ensure all rounds are captured.</p>
+  <p id="status" style="font-size: 12px; color: green;"></p>
+  <script src="popup.js"></script>
+</body>
+</html>
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: popup.js'
+mkdir -p "$(dirname "popup.js")"
+rm -f "popup.js"
+cat  >> "popup.js" << 'EOF_ARCHIVE_CHUNK'
+document.getElementById('bulkLog').addEventListener('click', () => {
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    chrome.tabs.sendMessage(tabs[0].id, { type: 'BULK_LOG_REQUEST' }, (response) => {
+      if (chrome.runtime.lastError) {
+        document.getElementById('status').textContent = "Error: Please refresh the page!";
+        document.getElementById('status').style.color = 'red';
+      } else {
+        document.getElementById('status').textContent = "Extracting... Check downloads.";
+        document.getElementById('status').style.color = 'green';
+      }
+      setTimeout(() => window.close(), 3000);
+    });
+  });
+});
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/chatgpt.js'
+mkdir -p "$(dirname "modules/chatgpt.js")"
+rm -f "modules/chatgpt.js"
+cat  >> "modules/chatgpt.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://chatgpt.com/*
+// @match *://chat.openai.com/*
+// @host_permissions *://chatgpt.com/*
+// @host_permissions *://chat.openai.com/*
+(function() {
+    const match = (host, path) => host.includes('chatgpt.com') || host.includes('chat.openai.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // ChatGPT reasoning/thinking blocks
+        const thinkingElement = lastAssistantMsg.querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove(); 
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+                if (thinkingElement) {
+                    thinkingHtml = cleanNode(thinkingElement);
+                }
+                responseHtml = cleanNode(assistantMessages[i]);
+            }
+
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.chatgpt = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/claude.js'
+mkdir -p "$(dirname "modules/claude.js")"
+rm -f "modules/claude.js"
+cat  >> "modules/claude.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://claude.ai/*
+// @host_permissions *://claude.ai/*
+(function() {
+    const match = (host, path) => host.includes('claude.ai');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-testid="user-message"]');
+        const assistantMessages = document.querySelectorAll('.font-claude-message');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // Claude thinking blocks often have this background or a specific testid
+        const thinkingElement = lastAssistantMsg.querySelector('.bg-gray-100, [class*="thinking"], [data-testid="thinking"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove();
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-testid="user-message"]');
+        const assistantMessages = document.querySelectorAll('.font-claude-message');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.bg-gray-100, [class*="thinking"], [data-testid="thinking"]');
+                if (thinkingElement) {
+                    thinkingHtml = cleanNode(thinkingElement);
+                }
+                responseHtml = cleanNode(assistantMessages[i]);
+            }
+
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.claude = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/duckai.js'
+mkdir -p "$(dirname "modules/duckai.js")"
+rm -f "modules/duckai.js"
+cat  >> "modules/duckai.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://duck.ai/*
+// @host_permissions *://duck.ai/*
+(function() {
+    const match = (host, path) => host.includes('duck.ai');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('article[data-testid^="user-message"], .msg__user');
+        const assistantMessages = document.querySelectorAll('article[data-testid^="assistant-message"], .msg__assistant');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('article[data-testid^="user-message"], .msg__user');
+        const assistantMessages = document.querySelectorAll('article[data-testid^="assistant-message"], .msg__assistant');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.duckai = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/gemini.js'
+mkdir -p "$(dirname "modules/gemini.js")"
+rm -f "modules/gemini.js"
+cat  >> "modules/gemini.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://gemini.google.com/*
+// @match *://*.googleusercontent.com/*
+// @host_permissions *://gemini.google.com/*
+// @host_permissions *://*.googleusercontent.com/*
+(function() {
+    const match = (host, path) => host.includes('gemini.google.com');
+
+    const cleanNode = (node) => {
+        if (!node) return "";
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button[aria-label="Copy"], button[aria-label="Listen"], button[aria-label="Share"], button[aria-label="Edit"], button[aria-label="Good response"], button[aria-label="Bad response"], button[aria-label="Generate more"]').forEach(el => el.remove());
+        return clone.outerHTML || clone.innerHTML; 
+    };
+
+    const rawClone = (node) => {
+        if (!node) return "";
+        return node.cloneNode(true).outerHTML;
+    };
+
+    // FIX: Smarter session name extraction
+    const getSessionName = () => {
+        // Look for the active/selected conversation in the sidebar
+        const activeItem = document.querySelector('.chat-history-item-selected, [aria-current="page"] .conversation-title, [data-test-id="conversation-title"]');
+        if (activeItem && activeItem.innerText.trim() && !activeItem.innerText.includes("Flash")) {
+            return activeItem.innerText.trim();
+        }
+        
+        // Fallback: Use the very first user prompt as the title
+        const firstPrompt = document.querySelector('user-query-content, user-query, .query-text');
+        if (firstPrompt && firstPrompt.innerText.trim()) {
+            const text = firstPrompt.innerText.trim().replace(/\n/g, ' ');
+            return text.length > 50 ? text.substring(0, 50) + "..." : text;
+        }
+        
+        return "Untitled Gemini Session";
+    };
+
+    const extractMetadata = (node) => {
+        if (!node) return {};
+        const metadata = { messageIds: [], testIds: [], citations: [] };
+        
+        const idEls = node.querySelectorAll('[data-message-id], [data-id]:not(script)');
+        idEls.forEach(el => {
+            const id = el.getAttribute('data-message-id') || el.getAttribute('data-id');
+            if (id && !metadata.messageIds.includes(id)) metadata.messageIds.push(id);
+        });
+
+        const testEls = node.querySelectorAll('[data-test-id]');
+        testEls.forEach(el => {
+            const testId = el.getAttribute('data-test-id');
+            if (testId && !metadata.testIds.includes(testId)) metadata.testIds.push(testId);
+        });
+
+        const citeEls = node.querySelectorAll('[data-provenance], [data-citation]');
+        citeEls.forEach(el => {
+            const cite = el.getAttribute('data-provenance') || el.getAttribute('data-citation');
+            const link = el.href || (el.closest('a') ? el.closest('a').href : null);
+            if (cite && !metadata.citations.some(c => c.id === cite)) {
+                metadata.citations.push({ id: cite, url: link });
+            }
+        });
+        return metadata;
+    };
+
+    // FIX: Traverse in strict DOM order, no visual sorting
+    const getTurns = () => {
+        const allEls = Array.from(document.querySelectorAll('user-query, model-response'));
+        const validTurns = [];
+        let currentTurn = document.createElement('div');
+        
+        for (let el of allEls) {
+            const isUser = el.tagName.toLowerCase() === 'user-query';
+            if (isUser) {
+                // If we already have content, push the previous turn
+                if (currentTurn.children.length > 0) {
+                    validTurns.push(currentTurn);
+                }
+                // Start a new turn
+                currentTurn = document.createElement('div');
+                currentTurn.appendChild(el.cloneNode(true));
+            } else {
+                // It's a model response, add to current turn
+                currentTurn.appendChild(el.cloneNode(true));
+            }
+        }
+        // Push the final turn
+        if (currentTurn.children.length > 0) validTurns.push(currentTurn);
+        
+        return validTurns;
+    };
+
+    const extract = () => {
+        const turns = getTurns();
+        const lastTurn = turns[turns.length - 1];
+        if (!lastTurn) return null;
+
+        const userEl = lastTurn.querySelector('user-query-content, user-query, .query-text');
+        const modelEl = lastTurn.querySelector('message-content, model-response, .response-container');
+
+        return {
+            promptHtml: cleanNode(userEl),
+            thinkingHtml: "",
+            responseHtml: cleanNode(modelEl),
+            roundHtml: rawClone(lastTurn),
+            metadata: extractMetadata(lastTurn)
+        };
+    };
+
+    const bulkExtract = () => {
+        const turns = getTurns();
+        const rounds = [];
+        for (let turn of turns) {
+            const userEl = turn.querySelector('user-query-content, user-query, .query-text');
+            const modelEl = turn.querySelector('message-content, model-response, .response-container');
+
+            const promptHtml = cleanNode(userEl);
+            const responseHtml = cleanNode(modelEl);
+            const roundHtml = rawClone(turn);
+
+            if (promptHtml || responseHtml || roundHtml) {
+                rounds.push({ 
+                    promptHtml, 
+                    thinkingHtml: "", 
+                    responseHtml, 
+                    roundHtml,
+                    metadata: extractMetadata(turn)
+                });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.gemini = { match, extract, bulkExtract, getSessionName };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/google_flow.js'
+mkdir -p "$(dirname "modules/google_flow.js")"
+rm -f "modules/google_flow.js"
+cat  >> "modules/google_flow.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://labs.google/fx/tools/flow*
+// @host_permissions *://labs.google/fx/tools/flow*
+(function() {
+    const match = (host, path) => host.includes('labs.google') && path.includes('fx/tools/flow');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const promptArea = document.querySelector('textarea, input[type="text"]');
+        if (!promptArea) return null;
+
+        const promptHtml = `<p>${promptArea.value || promptArea.innerText}</p>`;
+        let responseHtml = "";
+
+        const creationBlocks = document.querySelectorAll('[class*="creation"], [class*="result"], [class*="generation"], [class*="asset"]');
+        if (creationBlocks.length > 0) {
+            const lastBlock = creationBlocks[creationBlocks.length - 1];
+            responseHtml = cleanNode(lastBlock);
+        } else {
+            responseHtml = "<p>[Video generation initiated/completed - No extractable text metadata found]</p>";
+        }
+
+        return { promptHtml, thinkingHtml: "", responseHtml };
+    };
+
+    const bulkExtract = () => {
+        // Flow typically only shows the latest generation on screen
+        const data = extract();
+        return data ? [data] : [];
+    };
+
+    window.ForensicModules.google_flow = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/google-search-ai-logger.js'
+mkdir -p "$(dirname "modules/google-search-ai-logger.js")"
+rm -f "modules/google-search-ai-logger.js"
+cat  >> "modules/google-search-ai-logger.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://www.google.com/search*
+// @match *://*.google.com/search*
+// @host_permissions *://www.google.com/*
+// @host_permissions *://*.google.com/*
+// @run_at document_idle
+
+/**
+ * google-search-ai-logger.js
+ */
+
+(() => {
+  'use strict';
+
+  const MODULE_NAME = 'google-search-ai';
+  const BUTTON_LABEL = 'Log Entire Session';
+  const BUTTON_ID = 'forensic-log-session-btn';
+
+  const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'svg', 'path', 'img', 'br', 'hr', 'input', 'button']);
+
+  // ─── Page Detection (content-based, not just URL) ───
+
+  function shouldActivate() {
+    // Method 1: URL parameter (fast, works for live AI Mode)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('udm') === '50' || params.get('udm') === '14') return 'url_param';
+
+    // Method 2: Actual content on the page
+    // (works for saved sessions that might have different URLs)

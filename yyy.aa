@@ -1,0 +1,500 @@
+=== manifest.json ===
+
+``
+{
+  "manifest_version": 3,
+  "name": "LLM Forensic Logger",
+  "version": "1.26",
+  "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://chatgpt.com/*",
+    "*://chat.openai.com/*",
+    "*://claude.ai/*",
+    "*://duck.ai/*",
+    "*://gemini.google.com/*",
+    "*://*.googleusercontent.com/*",
+    "*://labs.google/fx/tools/flow*",
+    "*://www.google.com/*",
+    "*://*.google.com/*",
+    "*://notebooklm.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "LLM Forensic Logger",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://chatgpt.com/*",
+        "*://chat.openai.com/*",
+        "*://claude.ai/*",
+        "*://duck.ai/*",
+        "*://gemini.google.com/*",
+        "*://*.googleusercontent.com/*",
+        "*://labs.google/fx/tools/flow*",
+        "*://www.google.com/search*",
+        "*://*.google.com/search*",
+        "*://notebooklm.google.com/*"
+      ],
+      "js": [
+        "modules/index.js",
+        "modules/chatgpt.js",
+        "modules/claude.js",
+        "modules/duckai.js",
+        "modules/gemini.js",
+        "modules/google_flow.js",
+        "modules/google-search-ai-logger.js",
+        "modules/notebooklm.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
+
+```
+
+
+=== background.js ===
+
+``
+console.log("[Forensic Logger] New background.js loaded successfully.");
+
+let isProcessing = false;
+const logQueue = [];
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'LOG_LLM_ROUND') {
+    logQueue.push({ payload: message.payload, isBulk: false });
+    processQueue();
+    sendResponse({ status: 'success' });
+  } else if (message.type === 'BULK_LOG_SESSION') {
+    const { rounds, sessionName, chatId } = message.payload;
+    console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
+    
+    // ADD THIS: Reset the sequence number for this chat to 0 before queueing
+    if (chatId) {
+      getSessionState(chatId, true).then(() => {
+        rounds.forEach((roundData) => {
+          const payload = {
+            prompt: roundData.prompt,
+            thinking: roundData.thinking || "",
+            response: roundData.response,
+            mediaFiles: roundData.mediaFiles || [],
+            roundHtml: roundData.roundHtml || "",
+            sessionName: sessionName || "Untitled Session",
+            metadata: roundData.metadata || {},
+            chatId: chatId, // Pass chatId in payload
+            generationDurationMs: 0,
+            domNodeCount: 0,
+            origin: sender.tab ? sender.tab.url : 'unknown'
+          };
+          logQueue.push({ payload, isBulk: true });
+        });
+        processQueue();
+      });
+    }
+    sendResponse({ status: 'success' });
+  }
+  return true;
+});
+
+async function processQueue() {
+  if (isProcessing || logQueue.length === 0) return;
+  isProcessing = true;
+
+  const { payload } = logQueue.shift();
+  await logRound(payload, payload.chatId);
+
+  isProcessing = false;
+  if (logQueue.length > 0) setTimeout(processQueue, 100);
+}
+
+// UPDATED: Added shouldReset parameter
+async function getSessionState(chatId, shouldReset = false) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  
+  if (!sessions[chatId] || shouldReset) {
+    // Generate a NEW Session ID and reset the round number to 0
+    sessions[chatId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
+    await chrome.storage.local.set({ sessions });
+  }
+  
+  return sessions[chatId];
+}
+
+async function saveSessionState(chatId, state) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  sessions[chatId] = state;
+  await chrome.storage.local.set({ sessions });
+}
+
+async function logRound(payload, chatId) {
+  const state = await getSessionState(chatId);
+  state.round_number += 1;
+  await saveSessionState(chatId, state);
+
+  const roundNum = state.round_number;
+  const seqNum = String(roundNum).padStart(8, '0');
+
+  const { hostname } = await chrome.storage.local.get(['hostname']);
+  const HOSTNAME = hostname || 'unknown-host';
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+
+  const baseFilename = `flush.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+  const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
+  const mediaDirName = `${baseFilename}.d`;
+
+  const mdContentRaw = createMarkdown(payload, state.SESSION_ID, roundNum);
+  const mdContent = mdContentRaw.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const mdUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(mdContent);
+
+  const jsonContent = createJsonMetadata(payload, state.SESSION_ID, roundNum, dateStr, timeStr, HOSTNAME);
+  const jsonUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(jsonContent, null, 2));
+
+  const xhtmlContent = `<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="UTF-8"/><title>Round ${roundNum}</title></head><body>${payload.roundHtml || ""}</body></html>`;
+  const finalXhtmlContent = xhtmlContent.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const xhtmlUrl = 'data:application/xhtml+xml;charset=utf-8,' + encodeURIComponent(finalXhtmlContent);
+
+  chrome.downloads.download({ url: mdUrl, filename: `${folderPath}${baseFilename}.md`, saveAs: false });
+  chrome.downloads.download({ url: jsonUrl, filename: `${folderPath}${baseFilename}.json`, saveAs: false });
+  chrome.downloads.download({ url: xhtmlUrl, filename: `${folderPath}${baseFilename}.xhtml`, saveAs: false });
+
+  if (payload.mediaFiles && payload.mediaFiles.length > 0) {
+    payload.mediaFiles.forEach((media, idx) => {
+      setTimeout(() => {
+        const downloadUrl = media.directUrl || media.dataUrl;
+        if (downloadUrl) {
+          chrome.downloads.download({
+            url: downloadUrl,
+            filename: `${folderPath}${mediaDirName}/${media.filename}`,
+            saveAs: false
+          });
+        }
+      }, idx * 200);
+    });
+  }
+}
+
+function createMarkdown(payload, sessionId, roundNum) {
+  let md = `# AI Forensic Log\n\n`;
+  md += `**Session ID:** ${sessionId}\n`;
+  if (payload.sessionName) md += `**Session Name:** ${payload.sessionName}\n`;
+  md += `**Round:** ${roundNum}\n`;
+  md += `\n## User Prompt\n\n${payload.prompt}\n\n`;
+
+  if (payload.thinking && payload.thinking.trim().length > 0) {
+    md += `## AI Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
+  }
+  md += `## AI Response\n\n${payload.response}\n`;
+  return md;
+}
+
+function createJsonMetadata(payload, sessionId, roundNum, dateStr, timeStr, hostname) {
+  const responseWords = payload.response.split(/\s+/).length;
+  const promptWords = payload.prompt.split(/\s+/).length;
+  const hedgingWords = (payload.response.match(/\b(might be|could be|possibly|perhaps|assuming|I think|likely)\b/gi) || []).length;
+  const selfCorrections = (payload.response.match(/\b(Actually|Wait|Correction|I apologize|I made a mistake)\b/gi) || []).length;
+
+  return {
+    session_id: sessionId,
+    session_name: payload.sessionName || null,
+    round_number: roundNum,
+    timestamp_logged_utc: new Date().toISOString(),
+    hostname: hostname,
+    gemini_metadata: payload.metadata || {},
+    metrics: {
+      resource_usage: {
+        prompt_char_length: payload.prompt.length,
+        response_char_length: payload.response.length,
+        thinking_char_length: payload.thinking ? payload.thinking.length : 0,
+        prompt_word_count: promptWords,
+        response_word_count: responseWords,
+        generation_duration_ms: payload.generationDurationMs,
+        dom_node_count_at_log: payload.domNodeCount,
+        media_files_logged: payload.mediaFiles ? payload.mediaFiles.length : 0
+      },
+      drift_and_hallucination_indicators: {
+        hedging_language_count: hedgingWords,
+        self_correction_count: selfCorrections,
+        lexical_diversity: calculateLexicalDiversity(payload.response)
+      }
+    },
+    system_info: { url_origin: payload.origin }
+  };
+}
+
+function calculateLexicalDiversity(text) {
+  const words = text.toLowerCase().match(/\b(\w+)\b/g) || [];
+  if (words.length === 0) return 0;
+  return new Set(words).size / words.length;
+}
+
+```
+
+
+=== content.js ===
+
+``
+// HACK: Prevent aggressive SPAs from clearing our debug logs
+window.console.clear = () => { console.log('[Forensic Logger] Prevented console.clear()'); };
+
+let isLogging = false;
+let isBulkLogging = false;
+let lastLoggedPromptText = "";
+let debounceTimer = null;
+let streamStartTime = 0;
+let isScrolling = false;
+let scrollTimeout = null;
+const pageLoadTime = Date.now();
+
+// Detect when the user is scrolling so we don't log during virtual DOM shifts
+window.addEventListener('scroll', () => {
+    isScrolling = true;
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(() => { isScrolling = false; }, 1000);
+}, true);
+
+const observer = new MutationObserver((mutations) => {
+    // Ignore mutations during the first 5 seconds of page load
+    if (Date.now() - pageLoadTime < 5000) return;
+    
+    // Ignore mutations while scrolling
+    if (isScrolling) return;
+
+    if (isLogging || isBulkLogging) return;
+    if (streamStartTime === 0) streamStartTime = Date.now();
+
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        const duration = Date.now() - streamStartTime;
+        streamStartTime = 0;
+        processLatestRound(duration);
+    }, 1500);
+});
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+async function processLatestRound(durationMs) {
+    if (isLogging) return;
+    isLogging = true;
+
+    try {
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        let extractedData = null;
+        let matchedModuleName = "";
+
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path)) {
+                extractedData = mod.extract();
+                matchedModuleName = moduleName;
+                break;
+            }
+        }
+
+        if (extractedData && extractedData.promptHtml) {
+            // Convert HTML to text for a more stable comparison
+            const currentPromptText = extractedData.promptHtml.replace(/<[^>]+>/g, '').trim();
+            if (currentPromptText === lastLoggedPromptText) {
+                isLogging = false;
+                return;
+            }
+            lastLoggedPromptText = currentPromptText;
+            
+            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(extractedData);
+            
+            const mod = window.ForensicModules[matchedModuleName];
+            const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+            
+            const payload = {
+                prompt: markdown.prompt,
+                thinking: markdown.thinking,
+                response: markdown.response,
+                mediaFiles: mediaFiles,
+                roundHtml: roundHtml,
+                sessionName: sessionName,
+                metadata: extractedData.metadata || {},
+                chatId: window.location.pathname.split('/').pop(), // ADD THIS
+                generationDurationMs: durationMs,
+                domNodeCount: document.getElementsByTagName('*').length,
+                origin: window.location.origin
+            };
+
+            if (chrome.runtime && chrome.runtime.id) {
+                chrome.runtime.sendMessage({ type: 'LOG_LLM_ROUND', payload: payload })
+                    .catch(e => {
+                        console.log("[Forensic Logger] Extension context invalidated. Please refresh the page.");
+                        observer.disconnect();
+                    });
+            }
+        }
+    } catch (error) {
+        console.error('[Forensic Logger] Error processing round:', error);
+    } finally {
+        isLogging = false;
+    }
+}
+
+// Listen for manual bulk extraction
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === 'BULK_LOG_REQUEST') {
+        clearTimeout(debounceTimer); // CRITICAL: Stop the pending live log
+        observer.disconnect();       // CRITICAL: Stop observing DOM changes
+        isBulkLogging = true;
+        console.log("[Forensic Logger] Received bulk log request. Live logging paused.");
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path) && mod.bulkExtract) {
+                (async () => {
+                    try {
+                        const allRounds = mod.bulkExtract();
+                        console.log(`[Forensic Logger] Found ${allRounds.length} rounds. Processing media...`);
+                        
+                        const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+                        
+                        const processedRounds = [];
+                        for (const round of allRounds) {
+                            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(round);
+                            processedRounds.push({
+                                prompt: markdown.prompt,
+                                thinking: markdown.thinking,
+                                response: markdown.response,
+                                mediaFiles: mediaFiles,
+                                roundHtml: roundHtml,
+                                metadata: round.metadata || {}
+                            });
+                        }
+                        
+                        await chrome.runtime.sendMessage({ 
+                            type: 'BULK_LOG_SESSION', 
+                            payload: {
+                                rounds: processedRounds,
+                                sessionName: sessionName,
+                                chatId: window.location.pathname.split('/').pop() // ADD THIS
+                            }
+                        });
+                        sendResponse({ status: 'success' });
+                    } catch (e) {
+                        console.error("[Forensic Logger] Bulk log failed:", e);
+                        sendResponse({ status: 'error', error: e.message });
+                    } finally {
+                        isBulkLogging = false; 
+                    }
+                })();
+                return true; 
+            }
+        }
+        sendResponse({ status: 'no_module_matched' });
+        isBulkLogging = false;
+    }
+    return true;
+});
+// --- HTML to Markdown & Media Extraction Engine ---
+
+async function processHtmlAndMedia(data) {
+    let mediaFiles = [];
+    let mediaIndex = 0;
+    let attachmentIndex = 0;
+    
+    const processHtml = async (htmlString, isPromptSection) => {
+        if (!htmlString) return { md: "", html: "" };
+        const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+        
+        const mediaElements = Array.from(doc.querySelectorAll('img, video, a[href][download], a[href], [style*="background-image"]'));
+
+        for (let el of mediaElements) {
+            if (!el.closest('body')) continue;
+
+            let url = el.src || el.href || el.dataset.src;
+            
+            if ((!url || url.startsWith('data:')) && el.srcset) {
+                url = el.srcset.split(',')[0].split(' ')[0];
+            }
+            
+            if (!url && el.style && el.style.backgroundImage) {
+                const bgUrlMatch = el.style.backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                if (bgUrlMatch) url = bgUrlMatch[1];
+            }
+
+            if (!url || url.startsWith('data:') || url.startsWith('javascript:')) continue;
+
+            if (!isPromptSection && el.tagName === 'A' && !el.hasAttribute('download') && !url.match(/\.(png|jpg|jpeg|gif|pdf|mp4|webm|csv|webp|svg)$/i)) {
+                continue;
+            }
+
+            let isBlob = url.startsWith('blob:');
+            let dataUrl = null;
+            let ext = 'bin';
+
+            try {
+                if (isBlob) {
+                    const response = await fetch(url);
+                    const blob = await response.blob();
+                    
+                    if (blob.size > 10 * 1024 * 1024) {
+                        el.outerHTML = `\n[Media file too large to log automatically: ${url}]\n`;
+                        continue;
+                    }
+
+                    dataUrl = await new Promise(resolve => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.readAsDataURL(blob);
+                    });
+
+                    if (blob.type.includes('png')) ext = 'png';
+                    else if (blob.type.includes('jpeg') || blob.type.includes('jpg')) ext = 'jpg';
+                    else if (blob.type.includes('webp')) ext = 'webp';
+                    else if (blob.type.includes('mp4')) ext = 'mp4';
+                    else if (blob.type.includes('webm')) ext = 'webm';
+                    else if (blob.type.includes('pdf')) ext = 'pdf';
+                    else if (blob.type.includes('svg')) ext = 'svg';
+                } else {
+                    if (url.match(/\.([a-z0-9]{2,4})(\?|$)/i)) {
+                        const extMatch = url.match(/\.([a-z0-9]{2,4})(\?|$)/i);
+                        if (extMatch) ext = extMatch[1].toLowerCase();
+                    }
+                }
+
+                let isAttachment = false;
+                if (isPromptSection) {
+                    isAttachment = true;
+                } else {
+                    if (el.tagName === 'A' && el.hasAttribute('download')) isAttachment = true;
+                }
+
+                let filename = "";

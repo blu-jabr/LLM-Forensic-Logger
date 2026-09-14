@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LLM Forensic Logger",
-  "version": "1.18",
+  "version": "1.26",
   "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
   "permissions": [
     "downloads",
@@ -17,7 +17,8 @@
     "*://gemini.google.com/*",
     "*://*.googleusercontent.com/*",
     "*://labs.google/fx/tools/flow*",
-    "*://www.google.com/search*",
+    "*://www.google.com/*",
+    "*://*.google.com/*",
     "*://notebooklm.google.com/*"
   ],
   "background": {
@@ -39,6 +40,7 @@
         "*://*.googleusercontent.com/*",
         "*://labs.google/fx/tools/flow*",
         "*://www.google.com/search*",
+        "*://*.google.com/search*",
         "*://notebooklm.google.com/*"
       ],
       "js": [
@@ -48,7 +50,7 @@
         "modules/duckai.js",
         "modules/gemini.js",
         "modules/google_flow.js",
-        "modules/google_search.js",
+        "modules/google-search-ai-logger.js",
         "modules/notebooklm.js",
         "content.js"
       ],

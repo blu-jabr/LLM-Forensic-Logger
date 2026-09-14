@@ -1,0 +1,117 @@
+    if (!container) {
+      console.log(`[${MODULE_NAME}] Container vanished before processing could begin.`);
+      return;
+    }
+
+    const turns = extractAiTurns(container);
+    if (turns.length === 0) {
+      console.log(`[${MODULE_NAME}] Turns detected, but extraction found 0 elements. DOM might still be loading.`);
+      return;
+    }
+
+    const conversationLog = [];
+
+    turns.forEach((turnEl, index) => {
+      const cleanedData = cleanTurnElement(turnEl);
+      
+      console.log(`[${MODULE_NAME}]   Turn [${index}]: rawLen=${cleanedData.rawLength} -> cleanedLen=${cleanedData.cleanedLength} citations=${cleanedData.citations.length}`);
+      console.log(`[${MODULE_NAME}]   Turn [${index}] Preview: "${cleanedData.text.substring(0, 120)}..."`);
+
+      conversationLog.push({
+        turnIndex: index,
+        text: cleanedData.text,
+        citations: cleanedData.citations
+      });
+    });
+
+    console.log(`[${MODULE_NAME}] Forensic Log Complete. Turns processed: ${conversationLog.length}`);
+    console.log(`[${MODULE_NAME}] Final Log Object:`, conversationLog);
+    
+    // ────── LOG TO EXTENSION STORAGE HERE ──────
+    // chrome.storage.local.set({ googleAiHistory: conversationLog });
+  }
+
+  // ─── 6. Initialization ───
+
+  function init() {
+    console.log(`[${MODULE_NAME}] Initializing Forensic Logger...`);
+    
+    // 1. Check if a history conversation is already fully rendered on the page 
+    // (e.g., if the user refreshed the page while looking at one)
+    const existingTurns = document.querySelectorAll(TURN_SELECTOR);
+    if (existingTurns.length > 0) {
+      console.log(`[${MODULE_NAME}] Found ${existingTurns.length} existing Turns on page load. Processing immediately.`);
+      processCurrentHistoryView();
+      // We still start the observer so we catch it if they click a different history item
+      observeForAiTurns();
+    } else {
+      // 2. If no turns exist yet, start the observer to wait for the user to click one
+      observeForAiTurns();
+    }
+  }
+
+  // Run initialization
+  init();
+
+```
+
+
+=== modules/index.js ===
+
+``
+// Initialize the global namespace for modular LLM handlers
+window.ForensicModules = {};
+
+```
+
+
+=== modules/notebooklm.js ===
+
+``
+// @match *://notebooklm.google.com/*
+// @host_permissions *://notebooklm.google.com/*
+(function() {
+    const match = (host, path) => host.includes('notebooklm.google.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.notebooklm = { match, extract, bulkExtract };
+})();
+
+```
+
+

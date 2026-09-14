@@ -1,0 +1,3117 @@
+=== manifest.json ===
+
+``
+{
+  "manifest_version": 3,
+  "name": "LLM Forensic Logger",
+  "version": "1.26",
+  "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://chatgpt.com/*",
+    "*://chat.openai.com/*",
+    "*://claude.ai/*",
+    "*://duck.ai/*",
+    "*://gemini.google.com/*",
+    "*://*.googleusercontent.com/*",
+    "*://labs.google/fx/tools/flow*",
+    "*://www.google.com/*",
+    "*://*.google.com/*",
+    "*://notebooklm.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "LLM Forensic Logger",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://chatgpt.com/*",
+        "*://chat.openai.com/*",
+        "*://claude.ai/*",
+        "*://duck.ai/*",
+        "*://gemini.google.com/*",
+        "*://*.googleusercontent.com/*",
+        "*://labs.google/fx/tools/flow*",
+        "*://www.google.com/search*",
+        "*://*.google.com/search*",
+        "*://notebooklm.google.com/*"
+      ],
+      "js": [
+        "modules/index.js",
+        "modules/chatgpt.js",
+        "modules/claude.js",
+        "modules/duckai.js",
+        "modules/gemini.js",
+        "modules/google_flow.js",
+        "modules/google-search-ai-logger.js",
+        "modules/notebooklm.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
+
+```
+
+
+=== background.js ===
+
+``
+console.log("[Forensic Logger] New background.js loaded successfully.");
+
+let isProcessing = false;
+const logQueue = [];
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'LOG_LLM_ROUND') {
+    logQueue.push({ payload: message.payload, isBulk: false });
+    processQueue();
+    sendResponse({ status: 'success' });
+  } else if (message.type === 'BULK_LOG_SESSION') {
+    const { rounds, sessionName, chatId } = message.payload;
+    console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
+    
+    // ADD THIS: Reset the sequence number for this chat to 0 before queueing
+    if (chatId) {
+      getSessionState(chatId, true).then(() => {
+        rounds.forEach((roundData) => {
+          const payload = {
+            prompt: roundData.prompt,
+            thinking: roundData.thinking || "",
+            response: roundData.response,
+            mediaFiles: roundData.mediaFiles || [],
+            roundHtml: roundData.roundHtml || "",
+            sessionName: sessionName || "Untitled Session",
+            metadata: roundData.metadata || {},
+            chatId: chatId, // Pass chatId in payload
+            generationDurationMs: 0,
+            domNodeCount: 0,
+            origin: sender.tab ? sender.tab.url : 'unknown'
+          };
+          logQueue.push({ payload, isBulk: true });
+        });
+        processQueue();
+      });
+    }
+    sendResponse({ status: 'success' });
+  }
+  return true;
+});
+
+async function processQueue() {
+  if (isProcessing || logQueue.length === 0) return;
+  isProcessing = true;
+
+  const { payload } = logQueue.shift();
+  await logRound(payload, payload.chatId);
+
+  isProcessing = false;
+  if (logQueue.length > 0) setTimeout(processQueue, 100);
+}
+
+// UPDATED: Added shouldReset parameter
+async function getSessionState(chatId, shouldReset = false) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  
+  if (!sessions[chatId] || shouldReset) {
+    // Generate a NEW Session ID and reset the round number to 0
+    sessions[chatId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
+    await chrome.storage.local.set({ sessions });
+  }
+  
+  return sessions[chatId];
+}
+
+async function saveSessionState(chatId, state) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  sessions[chatId] = state;
+  await chrome.storage.local.set({ sessions });
+}
+
+async function logRound(payload, chatId) {
+  const state = await getSessionState(chatId);
+  state.round_number += 1;
+  await saveSessionState(chatId, state);
+
+  const roundNum = state.round_number;
+  const seqNum = String(roundNum).padStart(8, '0');
+
+  const { hostname } = await chrome.storage.local.get(['hostname']);
+  const HOSTNAME = hostname || 'unknown-host';
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+
+  const baseFilename = `flush.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+  const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
+  const mediaDirName = `${baseFilename}.d`;
+
+  const mdContentRaw = createMarkdown(payload, state.SESSION_ID, roundNum);
+  const mdContent = mdContentRaw.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const mdUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(mdContent);
+
+  const jsonContent = createJsonMetadata(payload, state.SESSION_ID, roundNum, dateStr, timeStr, HOSTNAME);
+  const jsonUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(jsonContent, null, 2));
+
+  const xhtmlContent = `<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="UTF-8"/><title>Round ${roundNum}</title></head><body>${payload.roundHtml || ""}</body></html>`;
+  const finalXhtmlContent = xhtmlContent.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const xhtmlUrl = 'data:application/xhtml+xml;charset=utf-8,' + encodeURIComponent(finalXhtmlContent);
+
+  chrome.downloads.download({ url: mdUrl, filename: `${folderPath}${baseFilename}.md`, saveAs: false });
+  chrome.downloads.download({ url: jsonUrl, filename: `${folderPath}${baseFilename}.json`, saveAs: false });
+  chrome.downloads.download({ url: xhtmlUrl, filename: `${folderPath}${baseFilename}.xhtml`, saveAs: false });
+
+  if (payload.mediaFiles && payload.mediaFiles.length > 0) {
+    payload.mediaFiles.forEach((media, idx) => {
+      setTimeout(() => {
+        const downloadUrl = media.directUrl || media.dataUrl;
+        if (downloadUrl) {
+          chrome.downloads.download({
+            url: downloadUrl,
+            filename: `${folderPath}${mediaDirName}/${media.filename}`,
+            saveAs: false
+          });
+        }
+      }, idx * 200);
+    });
+  }
+}
+
+function createMarkdown(payload, sessionId, roundNum) {
+  let md = `# AI Forensic Log\n\n`;
+  md += `**Session ID:** ${sessionId}\n`;
+  if (payload.sessionName) md += `**Session Name:** ${payload.sessionName}\n`;
+  md += `**Round:** ${roundNum}\n`;
+  md += `\n## User Prompt\n\n${payload.prompt}\n\n`;
+
+  if (payload.thinking && payload.thinking.trim().length > 0) {
+    md += `## AI Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
+  }
+  md += `## AI Response\n\n${payload.response}\n`;
+  return md;
+}
+
+function createJsonMetadata(payload, sessionId, roundNum, dateStr, timeStr, hostname) {
+  const responseWords = payload.response.split(/\s+/).length;
+  const promptWords = payload.prompt.split(/\s+/).length;
+  const hedgingWords = (payload.response.match(/\b(might be|could be|possibly|perhaps|assuming|I think|likely)\b/gi) || []).length;
+  const selfCorrections = (payload.response.match(/\b(Actually|Wait|Correction|I apologize|I made a mistake)\b/gi) || []).length;
+
+  return {
+    session_id: sessionId,
+    session_name: payload.sessionName || null,
+    round_number: roundNum,
+    timestamp_logged_utc: new Date().toISOString(),
+    hostname: hostname,
+    gemini_metadata: payload.metadata || {},
+    metrics: {
+      resource_usage: {
+        prompt_char_length: payload.prompt.length,
+        response_char_length: payload.response.length,
+        thinking_char_length: payload.thinking ? payload.thinking.length : 0,
+        prompt_word_count: promptWords,
+        response_word_count: responseWords,
+        generation_duration_ms: payload.generationDurationMs,
+        dom_node_count_at_log: payload.domNodeCount,
+        media_files_logged: payload.mediaFiles ? payload.mediaFiles.length : 0
+      },
+      drift_and_hallucination_indicators: {
+        hedging_language_count: hedgingWords,
+        self_correction_count: selfCorrections,
+        lexical_diversity: calculateLexicalDiversity(payload.response)
+      }
+    },
+    system_info: { url_origin: payload.origin }
+  };
+}
+
+function calculateLexicalDiversity(text) {
+  const words = text.toLowerCase().match(/\b(\w+)\b/g) || [];
+  if (words.length === 0) return 0;
+  return new Set(words).size / words.length;
+}
+
+```
+
+
+=== content.js ===
+
+``
+// HACK: Prevent aggressive SPAs from clearing our debug logs
+window.console.clear = () => { console.log('[Forensic Logger] Prevented console.clear()'); };
+
+let isLogging = false;
+let isBulkLogging = false;
+let lastLoggedPromptText = "";
+let debounceTimer = null;
+let streamStartTime = 0;
+let isScrolling = false;
+let scrollTimeout = null;
+const pageLoadTime = Date.now();
+
+// Detect when the user is scrolling so we don't log during virtual DOM shifts
+window.addEventListener('scroll', () => {
+    isScrolling = true;
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(() => { isScrolling = false; }, 1000);
+}, true);
+
+const observer = new MutationObserver((mutations) => {
+    // Ignore mutations during the first 5 seconds of page load
+    if (Date.now() - pageLoadTime < 5000) return;
+    
+    // Ignore mutations while scrolling
+    if (isScrolling) return;
+
+    if (isLogging || isBulkLogging) return;
+    if (streamStartTime === 0) streamStartTime = Date.now();
+
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        const duration = Date.now() - streamStartTime;
+        streamStartTime = 0;
+        processLatestRound(duration);
+    }, 1500);
+});
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+async function processLatestRound(durationMs) {
+    if (isLogging) return;
+    isLogging = true;
+
+    try {
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        let extractedData = null;
+        let matchedModuleName = "";
+
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path)) {
+                extractedData = mod.extract();
+                matchedModuleName = moduleName;
+                break;
+            }
+        }
+
+        if (extractedData && extractedData.promptHtml) {
+            // Convert HTML to text for a more stable comparison
+            const currentPromptText = extractedData.promptHtml.replace(/<[^>]+>/g, '').trim();
+            if (currentPromptText === lastLoggedPromptText) {
+                isLogging = false;
+                return;
+            }
+            lastLoggedPromptText = currentPromptText;
+            
+            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(extractedData);
+            
+            const mod = window.ForensicModules[matchedModuleName];
+            const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+            
+            const payload = {
+                prompt: markdown.prompt,
+                thinking: markdown.thinking,
+                response: markdown.response,
+                mediaFiles: mediaFiles,
+                roundHtml: roundHtml,
+                sessionName: sessionName,
+                metadata: extractedData.metadata || {},
+                chatId: window.location.pathname.split('/').pop(), // ADD THIS
+                generationDurationMs: durationMs,
+                domNodeCount: document.getElementsByTagName('*').length,
+                origin: window.location.origin
+            };
+
+            if (chrome.runtime && chrome.runtime.id) {
+                chrome.runtime.sendMessage({ type: 'LOG_LLM_ROUND', payload: payload })
+                    .catch(e => {
+                        console.log("[Forensic Logger] Extension context invalidated. Please refresh the page.");
+                        observer.disconnect();
+                    });
+            }
+        }
+    } catch (error) {
+        console.error('[Forensic Logger] Error processing round:', error);
+    } finally {
+        isLogging = false;
+    }
+}
+
+// Listen for manual bulk extraction
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === 'BULK_LOG_REQUEST') {
+        clearTimeout(debounceTimer); // CRITICAL: Stop the pending live log
+        observer.disconnect();       // CRITICAL: Stop observing DOM changes
+        isBulkLogging = true;
+        console.log("[Forensic Logger] Received bulk log request. Live logging paused.");
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path) && mod.bulkExtract) {
+                (async () => {
+                    try {
+                        const allRounds = mod.bulkExtract();
+                        console.log(`[Forensic Logger] Found ${allRounds.length} rounds. Processing media...`);
+                        
+                        const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+                        
+                        const processedRounds = [];
+                        for (const round of allRounds) {
+                            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(round);
+                            processedRounds.push({
+                                prompt: markdown.prompt,
+                                thinking: markdown.thinking,
+                                response: markdown.response,
+                                mediaFiles: mediaFiles,
+                                roundHtml: roundHtml,
+                                metadata: round.metadata || {}
+                            });
+                        }
+                        
+                        await chrome.runtime.sendMessage({ 
+                            type: 'BULK_LOG_SESSION', 
+                            payload: {
+                                rounds: processedRounds,
+                                sessionName: sessionName,
+                                chatId: window.location.pathname.split('/').pop() // ADD THIS
+                            }
+                        });
+                        sendResponse({ status: 'success' });
+                    } catch (e) {
+                        console.error("[Forensic Logger] Bulk log failed:", e);
+                        sendResponse({ status: 'error', error: e.message });
+                    } finally {
+                        isBulkLogging = false; 
+                    }
+                })();
+                return true; 
+            }
+        }
+        sendResponse({ status: 'no_module_matched' });
+        isBulkLogging = false;
+    }
+    return true;
+});
+// --- HTML to Markdown & Media Extraction Engine ---
+
+async function processHtmlAndMedia(data) {
+    let mediaFiles = [];
+    let mediaIndex = 0;
+    let attachmentIndex = 0;
+    
+    const processHtml = async (htmlString, isPromptSection) => {
+        if (!htmlString) return { md: "", html: "" };
+        const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+        
+        const mediaElements = Array.from(doc.querySelectorAll('img, video, a[href][download], a[href], [style*="background-image"]'));
+
+        for (let el of mediaElements) {
+            if (!el.closest('body')) continue;
+
+            let url = el.src || el.href || el.dataset.src;
+            
+            if ((!url || url.startsWith('data:')) && el.srcset) {
+                url = el.srcset.split(',')[0].split(' ')[0];
+            }
+            
+            if (!url && el.style && el.style.backgroundImage) {
+                const bgUrlMatch = el.style.backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                if (bgUrlMatch) url = bgUrlMatch[1];
+            }
+
+            if (!url || url.startsWith('data:') || url.startsWith('javascript:')) continue;
+
+            if (!isPromptSection && el.tagName === 'A' && !el.hasAttribute('download') && !url.match(/\.(png|jpg|jpeg|gif|pdf|mp4|webm|csv|webp|svg)$/i)) {
+                continue;
+            }
+
+            let isBlob = url.startsWith('blob:');
+            let dataUrl = null;
+            let ext = 'bin';
+
+            try {
+                if (isBlob) {
+                    const response = await fetch(url);
+                    const blob = await response.blob();
+                    
+                    if (blob.size > 10 * 1024 * 1024) {
+                        el.outerHTML = `\n[Media file too large to log automatically: ${url}]\n`;
+                        continue;
+                    }
+
+                    dataUrl = await new Promise(resolve => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.readAsDataURL(blob);
+                    });
+
+                    if (blob.type.includes('png')) ext = 'png';
+                    else if (blob.type.includes('jpeg') || blob.type.includes('jpg')) ext = 'jpg';
+                    else if (blob.type.includes('webp')) ext = 'webp';
+                    else if (blob.type.includes('mp4')) ext = 'mp4';
+                    else if (blob.type.includes('webm')) ext = 'webm';
+                    else if (blob.type.includes('pdf')) ext = 'pdf';
+                    else if (blob.type.includes('svg')) ext = 'svg';
+                } else {
+                    if (url.match(/\.([a-z0-9]{2,4})(\?|$)/i)) {
+                        const extMatch = url.match(/\.([a-z0-9]{2,4})(\?|$)/i);
+                        if (extMatch) ext = extMatch[1].toLowerCase();
+                    }
+                }
+
+                let isAttachment = false;
+                if (isPromptSection) {
+                    isAttachment = true;
+                } else {
+                    if (el.tagName === 'A' && el.hasAttribute('download')) isAttachment = true;
+                }
+
+                let filename = "";
+                let originalFilename = el.getAttribute('download') ? el.getAttribute('download').split('/').pop().split('?')[0] : null;
+                
+                if (!originalFilename && url.match(/\/[^/]+\.[a-z0-9]{2,4}($|\?)/i)) {
+                    originalFilename = url.split('/').pop().split('?')[0];
+                }
+
+                if (originalFilename) {
+                    let baseName = originalFilename.replace(/\.[^/.]+$/, "");
+                    baseName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_');
+                    filename = `${baseName}.${ext}`;
+                } else {
+                    if (isAttachment) {
+                        attachmentIndex++;
+                        filename = `attachment-${attachmentIndex}.${ext}`;
+                    } else {
+                        mediaIndex++;
+                        filename = `media-${mediaIndex}.${ext}`;
+                    }
+                }
+
+                if (isBlob) {
+                    mediaFiles.push({ filename, dataUrl });
+                } else {
+                    mediaFiles.push({ filename, directUrl: url });
+                }
+
+                if (el.tagName === 'IMG' || el.tagName === 'VIDEO') {
+                    el.setAttribute('src', `flush.MEDIA_PLACEHOLDER/${filename}`);
+                    el.removeAttribute('srcset');
+                } else if (el.tagName === 'A') {
+                    el.setAttribute('href', `flush.MEDIA_PLACEHOLDER/${filename}`);
+                }
+            } catch (e) {
+                console.error("[Forensic Logger] Failed to process media:", url, e);
+            }
+        }
+
+        return { 
+            md: convertHtmlToMarkdown(doc.body.innerHTML), 
+            html: doc.body.innerHTML 
+        };
+    };
+
+    const promptRes = await processHtml(data.promptHtml, true);
+    const thinkingRes = await processHtml(data.thinkingHtml, false);
+    const responseRes = await processHtml(data.responseHtml, false);
+
+    let finalRoundHtml = "";
+    if (data.roundHtml) {
+        finalRoundHtml = data.roundHtml;
+    } else {
+        finalRoundHtml = `
+            <div class="forensic-user-prompt">${promptRes.html}</div>
+            <div class="forensic-ai-thinking">${thinkingRes.html}</div>
+            <div class="forensic-ai-response">${responseRes.html}</div>
+        `;
+    }
+
+    return { 
+        markdown: { prompt: promptRes.md, thinking: thinkingRes.md, response: responseRes.md }, 
+        mediaFiles,
+        roundHtml: finalRoundHtml
+    };
+}
+
+function convertHtmlToMarkdown(html) {
+    let md = html;
+    md = md.replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (m, c) => `\n\`\`\`\n${c}\n\`\`\`\n`);
+    md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (m, c) => `\`${c}\``);
+    md = md.replace(/<(strong|b)[^>]*>(.*?)<\/\1>/gi, '**$2**');
+    md = md.replace(/<(em|i)[^>]*>(.*?)<\/\1>/gi, '*$2*');
+    md = md.replace(/<h1[^>]*>(.*?)<\/h1>/gi, '\n# $1\n');
+    md = md.replace(/<h2[^>]*>(.*?)<\/h2>/gi, '\n## $1\n');
+    md = md.replace(/<h3[^>]*>(.*?)<\/h3>/gi, '\n### $1\n');
+    md = md.replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n');
+    md = md.replace(/<\/?(ul|ol)[^>]*>/gi, '\n');
+    md = md.replace(/<img[^>]*src="(.*?)"[^>]*>/gi, '\n![]($1)\n');
+    md = md.replace(/<video[^>]*src="(.*?)"[^>]*>.*?<\/video>/gi, '\n[Video]($1)\n');
+    md = md.replace(/<a[^>]*href="(.*?)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+    md = md.replace(/<br\s*\/?>/gi, '\n');
+    md = md.replace(/<p[^>]*>(.*?)<\/p>/gi, '\n$1\n');
+    md = md.replace(/<[^>]+>/g, '');
+    
+    const txt = document.createElement('textarea');
+    txt.innerHTML = md;
+    md = txt.value;
+    
+    md = md.replace(/\n{3,}/g, '\n\n').trim();
+    return md;
+}
+
+```
+
+
+=== generate_manifest.sh ===
+
+``
+#!/bin/bash
+
+# Ensure jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is not installed. Please install it first (e.g., sudo apt install jq or brew install jq)."
+    exit 1
+fi
+
+MANIFEST="manifest.json"
+MODULES_DIR="modules"
+
+if [ ! -f "$MANIFEST" ]; then
+    echo "Error: $MANIFEST not found!"
+    exit 1
+fi
+
+# Initialize arrays
+JS_FILES=("modules/index.js")
+MATCHES=()
+HOST_PERMS=()
+
+# Read through all module files (excluding index.js)
+for file in "$MODULES_DIR"/*.js; do
+    filename=$(basename "$file")
+    if [ "$filename" == "index.js" ]; then
+        continue
+    fi
+
+    # Add to JS array
+    JS_FILES+=("$file")
+
+    # Extract @match and @host_permissions comments
+    while IFS= read -r line; do
+        if [[ "$line" =~ @match\ (.*) ]]; then
+            MATCHES+=("${BASH_REMATCH[1]}")
+        elif [[ "$line" =~ @host_permissions\ (.*) ]]; then
+            HOST_PERMS+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$file"
+done
+
+# Add content.js last
+JS_FILES+=("content.js")
+
+# Convert bash arrays to JSON arrays using jq
+JS_JSON=$(printf '%s\n' "${JS_FILES[@]}" | jq -R . | jq -s .)
+MATCHES_JSON=$(printf '%s\n' "${MATCHES[@]}" | jq -R . | jq -s .)
+HOST_PERMS_JSON=$(printf '%s\n' "${HOST_PERMS[@]}" | jq -R . | jq -s .)
+
+# Update manifest.json safely using jq
+jq \
+  --argjson js "$JS_JSON" \
+  --argjson matches "$MATCHES_JSON" \
+  --argjson host_perms "$HOST_PERMS_JSON" \
+  '.content_scripts[0].js = $js | .content_scripts[0].matches = $matches | .host_permissions = $host_perms' \
+  "$MANIFEST" > "manifest.tmp.json"
+
+mv "manifest.tmp.json" "$MANIFEST"
+
+echo "✅ manifest.json successfully updated with modules from $MODULES_DIR/"
+
+```
+
+
+=== HOWTO_add_new_LLM_model.md ===
+
+``
+# How to add a new LLM model
+
+I am building a Chromium extension that logs LLM chats. I need you to generate a new modular content script file for [INSERT LLM NAME] (URL: [INSERT LLM URL]).
+
+Please write the file following this exact format and structure. The file must start with the @match and @host_permissions comments so my build script can parse them. It must use an IIFE to attach itself to the `window.ForensicModules` namespace.
+
+The module must export two functions:
+1. `match(host, path)`: returns true if the host/path matches the LLM.
+2. `extract()`: queries the DOM for the latest user prompt, the LLM's thinking text (if applicable), and the LLM's response text. Returns an object: `{ promptText, thinkingText, responseText }`.
+
+Here is an example of the required format for a ChatGPT module:
+
+```javascript
+// @match *://chatgpt.com/*
+// @host_permissions *://chatgpt.com/*
+(function() {
+    const match = (host, path) => host.includes('chatgpt.com');
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptText = lastUserMsg.innerText;
+        let thinkingText = "";
+        const thinkingElement = lastAssistantMsg.querySelector('.whitespace-pre-wrap:has(> .text-gray-500)');
+        if (thinkingElement) thinkingText = thinkingElement.innerText;
+        const responseText = lastAssistantMsg.innerText.replace(thinkingText, '').trim();
+
+        return { promptText, thinkingText, responseText };
+    };
+    window.ForensicModules.chatgpt = { match, extract };
+})();
+```
+
+Please generate the equivalent file for [INSERT LLM NAME]. Use your knowledge of [INSERT LLM NAME]'s DOM structure, or use standard semantic HTML querying to find the most likely containers for user messages and AI responses. Name the module window.ForensicModules.[insert_module_name].
+
+
+
+```
+
+
+=== options.html ===
+
+``
+<!DOCTYPE html>
+<html>
+<head><title>Forensic Logger Settings</title></head>
+<body style="font-family: sans-serif; padding: 20px;">
+  <h2>Forensic Logger Configuration</h2>
+  <p>Since browser extensions cannot run bash commands, please enter your hostname:</p>
+  <label>Hostname (equivalent to <code>uname -n | cut -d. -f1</code>):</label>
+  <input type="text" id="hostname" style="margin-left: 10px;" />
+  <button id="save">Save</button>
+  <p id="status" style="color: green;"></p>
+</body>
+<script src="options.js"></script>
+</html>
+
+```
+
+
+=== options.js ===
+
+``
+document.addEventListener('DOMContentLoaded', () => {
+  chrome.storage.local.get(['hostname'], (result) => {
+    if (result.hostname) {
+      document.getElementById('hostname').value = result.hostname;
+    }
+  });
+
+  document.getElementById('save').addEventListener('click', () => {
+    const hostname = document.getElementById('hostname').value.trim() || 'unknown-host';
+    chrome.storage.local.set({ hostname: hostname }, () => {
+      const status = document.getElementById('status');
+      status.textContent = 'Saved.';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    });
+  });
+});
+
+```
+
+
+=== popup.html ===
+
+``
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 220px; padding: 10px; font-family: sans-serif; }
+    button { width: 100%; padding: 8px; cursor: pointer; margin-bottom: 5px; }
+    .warning { font-size: 11px; color: #555; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <button id="bulkLog">Log Entire Session</button>
+  <p class="warning">Note: For long chats, scroll to the very top of the conversation before clicking this to ensure all rounds are captured.</p>
+  <p id="status" style="font-size: 12px; color: green;"></p>
+  <script src="popup.js"></script>
+</body>
+</html>
+
+```
+
+
+=== popup.js ===
+
+``
+document.getElementById('bulkLog').addEventListener('click', () => {
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    chrome.tabs.sendMessage(tabs[0].id, { type: 'BULK_LOG_REQUEST' }, (response) => {
+      if (chrome.runtime.lastError) {
+        document.getElementById('status').textContent = "Error: Please refresh the page!";
+        document.getElementById('status').style.color = 'red';
+      } else {
+        document.getElementById('status').textContent = "Extracting... Check downloads.";
+        document.getElementById('status').style.color = 'green';
+      }
+      setTimeout(() => window.close(), 3000);
+    });
+  });
+});
+
+```
+
+
+=== plugin.txt ===
+
+``
+#!/bin/bash
+# Self-extracting archive generated via Bootstrap Protocol
+# Execute this script to extract contents to the current directory.
+
+echo 'Extracting: background.js'
+mkdir -p "$(dirname "background.js")"
+rm -f "background.js"
+cat  >> "background.js" << 'EOF_ARCHIVE_CHUNK'
+console.log("[Forensic Logger] New background.js loaded successfully.");
+
+let isProcessing = false;
+const logQueue = [];
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'LOG_LLM_ROUND') {
+    logQueue.push({ payload: message.payload, isBulk: false });
+    processQueue();
+    sendResponse({ status: 'success' });
+  } else if (message.type === 'BULK_LOG_SESSION') {
+    const { rounds, sessionName, chatId } = message.payload;
+    console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
+    
+    // ADD THIS: Reset the sequence number for this chat to 0 before queueing
+    if (chatId) {
+      getSessionState(chatId, true).then(() => {
+        rounds.forEach((roundData) => {
+          const payload = {
+            prompt: roundData.prompt,
+            thinking: roundData.thinking || "",
+            response: roundData.response,
+            mediaFiles: roundData.mediaFiles || [],
+            roundHtml: roundData.roundHtml || "",
+            sessionName: sessionName || "Untitled Session",
+            metadata: roundData.metadata || {},
+            chatId: chatId, // Pass chatId in payload
+            generationDurationMs: 0,
+            domNodeCount: 0,
+            origin: sender.tab ? sender.tab.url : 'unknown'
+          };
+          logQueue.push({ payload, isBulk: true });
+        });
+        processQueue();
+      });
+    }
+    sendResponse({ status: 'success' });
+  }
+  return true;
+});
+
+async function processQueue() {
+  if (isProcessing || logQueue.length === 0) return;
+  isProcessing = true;
+
+  const { payload } = logQueue.shift();
+  await logRound(payload, payload.chatId);
+
+  isProcessing = false;
+  if (logQueue.length > 0) setTimeout(processQueue, 100);
+}
+
+// UPDATED: Added shouldReset parameter
+async function getSessionState(chatId, shouldReset = false) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  
+  if (!sessions[chatId] || shouldReset) {
+    // Generate a NEW Session ID and reset the round number to 0
+    sessions[chatId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
+    await chrome.storage.local.set({ sessions });
+  }
+  
+  return sessions[chatId];
+}
+
+async function saveSessionState(chatId, state) {
+  const data = await chrome.storage.local.get(['sessions']);
+  const sessions = data.sessions || {};
+  sessions[chatId] = state;
+  await chrome.storage.local.set({ sessions });
+}
+
+async function logRound(payload, chatId) {
+  const state = await getSessionState(chatId);
+  state.round_number += 1;
+  await saveSessionState(chatId, state);
+
+  const roundNum = state.round_number;
+  const seqNum = String(roundNum).padStart(8, '0');
+
+  const { hostname } = await chrome.storage.local.get(['hostname']);
+  const HOSTNAME = hostname || 'unknown-host';
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+
+  const baseFilename = `flush.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+  const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
+  const mediaDirName = `${baseFilename}.d`;
+
+  const mdContentRaw = createMarkdown(payload, state.SESSION_ID, roundNum);
+  const mdContent = mdContentRaw.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const mdUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(mdContent);
+
+  const jsonContent = createJsonMetadata(payload, state.SESSION_ID, roundNum, dateStr, timeStr, HOSTNAME);
+  const jsonUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(jsonContent, null, 2));
+
+  const xhtmlContent = `<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="UTF-8"/><title>Round ${roundNum}</title></head><body>${payload.roundHtml || ""}</body></html>`;
+  const finalXhtmlContent = xhtmlContent.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
+  const xhtmlUrl = 'data:application/xhtml+xml;charset=utf-8,' + encodeURIComponent(finalXhtmlContent);
+
+  chrome.downloads.download({ url: mdUrl, filename: `${folderPath}${baseFilename}.md`, saveAs: false });
+  chrome.downloads.download({ url: jsonUrl, filename: `${folderPath}${baseFilename}.json`, saveAs: false });
+  chrome.downloads.download({ url: xhtmlUrl, filename: `${folderPath}${baseFilename}.xhtml`, saveAs: false });
+
+  if (payload.mediaFiles && payload.mediaFiles.length > 0) {
+    payload.mediaFiles.forEach((media, idx) => {
+      setTimeout(() => {
+        const downloadUrl = media.directUrl || media.dataUrl;
+        if (downloadUrl) {
+          chrome.downloads.download({
+            url: downloadUrl,
+            filename: `${folderPath}${mediaDirName}/${media.filename}`,
+            saveAs: false
+          });
+        }
+      }, idx * 200);
+    });
+  }
+}
+
+function createMarkdown(payload, sessionId, roundNum) {
+  let md = `# AI Forensic Log\n\n`;
+  md += `**Session ID:** ${sessionId}\n`;
+  if (payload.sessionName) md += `**Session Name:** ${payload.sessionName}\n`;
+  md += `**Round:** ${roundNum}\n`;
+  md += `\n## User Prompt\n\n${payload.prompt}\n\n`;
+
+  if (payload.thinking && payload.thinking.trim().length > 0) {
+    md += `## AI Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
+  }
+  md += `## AI Response\n\n${payload.response}\n`;
+  return md;
+}
+
+function createJsonMetadata(payload, sessionId, roundNum, dateStr, timeStr, hostname) {
+  const responseWords = payload.response.split(/\s+/).length;
+  const promptWords = payload.prompt.split(/\s+/).length;
+  const hedgingWords = (payload.response.match(/\b(might be|could be|possibly|perhaps|assuming|I think|likely)\b/gi) || []).length;
+  const selfCorrections = (payload.response.match(/\b(Actually|Wait|Correction|I apologize|I made a mistake)\b/gi) || []).length;
+
+  return {
+    session_id: sessionId,
+    session_name: payload.sessionName || null,
+    round_number: roundNum,
+    timestamp_logged_utc: new Date().toISOString(),
+    hostname: hostname,
+    gemini_metadata: payload.metadata || {},
+    metrics: {
+      resource_usage: {
+        prompt_char_length: payload.prompt.length,
+        response_char_length: payload.response.length,
+        thinking_char_length: payload.thinking ? payload.thinking.length : 0,
+        prompt_word_count: promptWords,
+        response_word_count: responseWords,
+        generation_duration_ms: payload.generationDurationMs,
+        dom_node_count_at_log: payload.domNodeCount,
+        media_files_logged: payload.mediaFiles ? payload.mediaFiles.length : 0
+      },
+      drift_and_hallucination_indicators: {
+        hedging_language_count: hedgingWords,
+        self_correction_count: selfCorrections,
+        lexical_diversity: calculateLexicalDiversity(payload.response)
+      }
+    },
+    system_info: { url_origin: payload.origin }
+  };
+}
+
+function calculateLexicalDiversity(text) {
+  const words = text.toLowerCase().match(/\b(\w+)\b/g) || [];
+  if (words.length === 0) return 0;
+  return new Set(words).size / words.length;
+}
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: content.js'
+mkdir -p "$(dirname "content.js")"
+rm -f "content.js"
+cat  >> "content.js" << 'EOF_ARCHIVE_CHUNK'
+// HACK: Prevent aggressive SPAs from clearing our debug logs
+window.console.clear = () => { console.log('[Forensic Logger] Prevented console.clear()'); };
+
+let isLogging = false;
+let isBulkLogging = false;
+let lastLoggedPromptText = "";
+let debounceTimer = null;
+let streamStartTime = 0;
+let isScrolling = false;
+let scrollTimeout = null;
+const pageLoadTime = Date.now();
+
+// Detect when the user is scrolling so we don't log during virtual DOM shifts
+window.addEventListener('scroll', () => {
+    isScrolling = true;
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(() => { isScrolling = false; }, 1000);
+}, true);
+
+const observer = new MutationObserver((mutations) => {
+    // Ignore mutations during the first 5 seconds of page load
+    if (Date.now() - pageLoadTime < 5000) return;
+    
+    // Ignore mutations while scrolling
+    if (isScrolling) return;
+
+    if (isLogging || isBulkLogging) return;
+    if (streamStartTime === 0) streamStartTime = Date.now();
+
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        const duration = Date.now() - streamStartTime;
+        streamStartTime = 0;
+        processLatestRound(duration);
+    }, 1500);
+});
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+async function processLatestRound(durationMs) {
+    if (isLogging) return;
+    isLogging = true;
+
+    try {
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        let extractedData = null;
+        let matchedModuleName = "";
+
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path)) {
+                extractedData = mod.extract();
+                matchedModuleName = moduleName;
+                break;
+            }
+        }
+
+        if (extractedData && extractedData.promptHtml) {
+            // Convert HTML to text for a more stable comparison
+            const currentPromptText = extractedData.promptHtml.replace(/<[^>]+>/g, '').trim();
+            if (currentPromptText === lastLoggedPromptText) {
+                isLogging = false;
+                return;
+            }
+            lastLoggedPromptText = currentPromptText;
+            
+            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(extractedData);
+            
+            const mod = window.ForensicModules[matchedModuleName];
+            const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+            
+            const payload = {
+                prompt: markdown.prompt,
+                thinking: markdown.thinking,
+                response: markdown.response,
+                mediaFiles: mediaFiles,
+                roundHtml: roundHtml,
+                sessionName: sessionName,
+                metadata: extractedData.metadata || {},
+                chatId: window.location.pathname.split('/').pop(), // ADD THIS
+                generationDurationMs: durationMs,
+                domNodeCount: document.getElementsByTagName('*').length,
+                origin: window.location.origin
+            };
+
+            if (chrome.runtime && chrome.runtime.id) {
+                chrome.runtime.sendMessage({ type: 'LOG_LLM_ROUND', payload: payload })
+                    .catch(e => {
+                        console.log("[Forensic Logger] Extension context invalidated. Please refresh the page.");
+                        observer.disconnect();
+                    });
+            }
+        }
+    } catch (error) {
+        console.error('[Forensic Logger] Error processing round:', error);
+    } finally {
+        isLogging = false;
+    }
+}
+
+// Listen for manual bulk extraction
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === 'BULK_LOG_REQUEST') {
+        clearTimeout(debounceTimer); // CRITICAL: Stop the pending live log
+        observer.disconnect();       // CRITICAL: Stop observing DOM changes
+        isBulkLogging = true;
+        console.log("[Forensic Logger] Received bulk log request. Live logging paused.");
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        
+        for (const moduleName in window.ForensicModules) {
+            const mod = window.ForensicModules[moduleName];
+            if (mod.match(host, path) && mod.bulkExtract) {
+                (async () => {
+                    try {
+                        const allRounds = mod.bulkExtract();
+                        console.log(`[Forensic Logger] Found ${allRounds.length} rounds. Processing media...`);
+                        
+                        const sessionName = mod.getSessionName ? mod.getSessionName() : document.title;
+                        
+                        const processedRounds = [];
+                        for (const round of allRounds) {
+                            const { markdown, mediaFiles, roundHtml } = await processHtmlAndMedia(round);
+                            processedRounds.push({
+                                prompt: markdown.prompt,
+                                thinking: markdown.thinking,
+                                response: markdown.response,
+                                mediaFiles: mediaFiles,
+                                roundHtml: roundHtml,
+                                metadata: round.metadata || {}
+                            });
+                        }
+                        
+                        await chrome.runtime.sendMessage({ 
+                            type: 'BULK_LOG_SESSION', 
+                            payload: {
+                                rounds: processedRounds,
+                                sessionName: sessionName,
+                                chatId: window.location.pathname.split('/').pop() // ADD THIS
+                            }
+                        });
+                        sendResponse({ status: 'success' });
+                    } catch (e) {
+                        console.error("[Forensic Logger] Bulk log failed:", e);
+                        sendResponse({ status: 'error', error: e.message });
+                    } finally {
+                        isBulkLogging = false; 
+                    }
+                })();
+                return true; 
+            }
+        }
+        sendResponse({ status: 'no_module_matched' });
+        isBulkLogging = false;
+    }
+    return true;
+});
+// --- HTML to Markdown & Media Extraction Engine ---
+
+async function processHtmlAndMedia(data) {
+    let mediaFiles = [];
+    let mediaIndex = 0;
+    let attachmentIndex = 0;
+    
+    const processHtml = async (htmlString, isPromptSection) => {
+        if (!htmlString) return { md: "", html: "" };
+        const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+        
+        const mediaElements = Array.from(doc.querySelectorAll('img, video, a[href][download], a[href], [style*="background-image"]'));
+
+        for (let el of mediaElements) {
+            if (!el.closest('body')) continue;
+
+            let url = el.src || el.href || el.dataset.src;
+            
+            if ((!url || url.startsWith('data:')) && el.srcset) {
+                url = el.srcset.split(',')[0].split(' ')[0];
+            }
+            
+            if (!url && el.style && el.style.backgroundImage) {
+                const bgUrlMatch = el.style.backgroundImage.match(/url\(["']?(.*?)["']?\)/);
+                if (bgUrlMatch) url = bgUrlMatch[1];
+            }
+
+            if (!url || url.startsWith('data:') || url.startsWith('javascript:')) continue;
+
+            if (!isPromptSection && el.tagName === 'A' && !el.hasAttribute('download') && !url.match(/\.(png|jpg|jpeg|gif|pdf|mp4|webm|csv|webp|svg)$/i)) {
+                continue;
+            }
+
+            let isBlob = url.startsWith('blob:');
+            let dataUrl = null;
+            let ext = 'bin';
+
+            try {
+                if (isBlob) {
+                    const response = await fetch(url);
+                    const blob = await response.blob();
+                    
+                    if (blob.size > 10 * 1024 * 1024) {
+                        el.outerHTML = `\n[Media file too large to log automatically: ${url}]\n`;
+                        continue;
+                    }
+
+                    dataUrl = await new Promise(resolve => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.readAsDataURL(blob);
+                    });
+
+                    if (blob.type.includes('png')) ext = 'png';
+                    else if (blob.type.includes('jpeg') || blob.type.includes('jpg')) ext = 'jpg';
+                    else if (blob.type.includes('webp')) ext = 'webp';
+                    else if (blob.type.includes('mp4')) ext = 'mp4';
+                    else if (blob.type.includes('webm')) ext = 'webm';
+                    else if (blob.type.includes('pdf')) ext = 'pdf';
+                    else if (blob.type.includes('svg')) ext = 'svg';
+                } else {
+                    if (url.match(/\.([a-z0-9]{2,4})(\?|$)/i)) {
+                        const extMatch = url.match(/\.([a-z0-9]{2,4})(\?|$)/i);
+                        if (extMatch) ext = extMatch[1].toLowerCase();
+                    }
+                }
+
+                let isAttachment = false;
+                if (isPromptSection) {
+                    isAttachment = true;
+                } else {
+                    if (el.tagName === 'A' && el.hasAttribute('download')) isAttachment = true;
+                }
+
+                let filename = "";
+                let originalFilename = el.getAttribute('download') ? el.getAttribute('download').split('/').pop().split('?')[0] : null;
+                
+                if (!originalFilename && url.match(/\/[^/]+\.[a-z0-9]{2,4}($|\?)/i)) {
+                    originalFilename = url.split('/').pop().split('?')[0];
+                }
+
+                if (originalFilename) {
+                    let baseName = originalFilename.replace(/\.[^/.]+$/, "");
+                    baseName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_');
+                    filename = `${baseName}.${ext}`;
+                } else {
+                    if (isAttachment) {
+                        attachmentIndex++;
+                        filename = `attachment-${attachmentIndex}.${ext}`;
+                    } else {
+                        mediaIndex++;
+                        filename = `media-${mediaIndex}.${ext}`;
+                    }
+                }
+
+                if (isBlob) {
+                    mediaFiles.push({ filename, dataUrl });
+                } else {
+                    mediaFiles.push({ filename, directUrl: url });
+                }
+
+                if (el.tagName === 'IMG' || el.tagName === 'VIDEO') {
+                    el.setAttribute('src', `flush.MEDIA_PLACEHOLDER/${filename}`);
+                    el.removeAttribute('srcset');
+                } else if (el.tagName === 'A') {
+                    el.setAttribute('href', `flush.MEDIA_PLACEHOLDER/${filename}`);
+                }
+            } catch (e) {
+                console.error("[Forensic Logger] Failed to process media:", url, e);
+            }
+        }
+
+        return { 
+            md: convertHtmlToMarkdown(doc.body.innerHTML), 
+            html: doc.body.innerHTML 
+        };
+    };
+
+    const promptRes = await processHtml(data.promptHtml, true);
+    const thinkingRes = await processHtml(data.thinkingHtml, false);
+    const responseRes = await processHtml(data.responseHtml, false);
+
+    let finalRoundHtml = "";
+    if (data.roundHtml) {
+        finalRoundHtml = data.roundHtml;
+    } else {
+        finalRoundHtml = `
+            <div class="forensic-user-prompt">${promptRes.html}</div>
+            <div class="forensic-ai-thinking">${thinkingRes.html}</div>
+            <div class="forensic-ai-response">${responseRes.html}</div>
+        `;
+    }
+
+    return { 
+        markdown: { prompt: promptRes.md, thinking: thinkingRes.md, response: responseRes.md }, 
+        mediaFiles,
+        roundHtml: finalRoundHtml
+    };
+}
+
+function convertHtmlToMarkdown(html) {
+    let md = html;
+    md = md.replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (m, c) => `\n\`\`\`\n${c}\n\`\`\`\n`);
+    md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (m, c) => `\`${c}\``);
+    md = md.replace(/<(strong|b)[^>]*>(.*?)<\/\1>/gi, '**$2**');
+    md = md.replace(/<(em|i)[^>]*>(.*?)<\/\1>/gi, '*$2*');
+    md = md.replace(/<h1[^>]*>(.*?)<\/h1>/gi, '\n# $1\n');
+    md = md.replace(/<h2[^>]*>(.*?)<\/h2>/gi, '\n## $1\n');
+    md = md.replace(/<h3[^>]*>(.*?)<\/h3>/gi, '\n### $1\n');
+    md = md.replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n');
+    md = md.replace(/<\/?(ul|ol)[^>]*>/gi, '\n');
+    md = md.replace(/<img[^>]*src="(.*?)"[^>]*>/gi, '\n![]($1)\n');
+    md = md.replace(/<video[^>]*src="(.*?)"[^>]*>.*?<\/video>/gi, '\n[Video]($1)\n');
+    md = md.replace(/<a[^>]*href="(.*?)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+    md = md.replace(/<br\s*\/?>/gi, '\n');
+    md = md.replace(/<p[^>]*>(.*?)<\/p>/gi, '\n$1\n');
+    md = md.replace(/<[^>]+>/g, '');
+    
+    const txt = document.createElement('textarea');
+    txt.innerHTML = md;
+    md = txt.value;
+    
+    md = md.replace(/\n{3,}/g, '\n\n').trim();
+    return md;
+}
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: Directory_Structure.md'
+mkdir -p "$(dirname "Directory_Structure.md")"
+rm -f "Directory_Structure.md"
+cat  >> "Directory_Structure.md" << 'EOF_ARCHIVE_CHUNK'
+# Directory Structure
+
+```
+LLM-Forensic-Logger/
+├── manifest.json
+├── background.js
+├── options.html
+├── options.js
+├── content.js
+└── modules/
+    ├── index.js
+    ├── chatgpt.js
+    ├── claude.js
+    ├── gemini.js
+    ├── notebooklm.js
+    ├── duckai.js
+    ├── google_search.js
+    └── google_flow.js
+```
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: generate_manifest.sh'
+mkdir -p "$(dirname "generate_manifest.sh")"
+rm -f "generate_manifest.sh"
+cat  >> "generate_manifest.sh" << 'EOF_ARCHIVE_CHUNK'
+#!/bin/bash
+
+# Ensure jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is not installed. Please install it first (e.g., sudo apt install jq or brew install jq)."
+    exit 1
+fi
+
+MANIFEST="manifest.json"
+MODULES_DIR="modules"
+
+if [ ! -f "$MANIFEST" ]; then
+    echo "Error: $MANIFEST not found!"
+    exit 1
+fi
+
+# Initialize arrays
+JS_FILES=("modules/index.js")
+MATCHES=()
+HOST_PERMS=()
+
+# Read through all module files (excluding index.js)
+for file in "$MODULES_DIR"/*.js; do
+    filename=$(basename "$file")
+    if [ "$filename" == "index.js" ]; then
+        continue
+    fi
+
+    # Add to JS array
+    JS_FILES+=("$file")
+
+    # Extract @match and @host_permissions comments
+    while IFS= read -r line; do
+        if [[ "$line" =~ @match\ (.*) ]]; then
+            MATCHES+=("${BASH_REMATCH[1]}")
+        elif [[ "$line" =~ @host_permissions\ (.*) ]]; then
+            HOST_PERMS+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$file"
+done
+
+# Add content.js last
+JS_FILES+=("content.js")
+
+# Convert bash arrays to JSON arrays using jq
+JS_JSON=$(printf '%s\n' "${JS_FILES[@]}" | jq -R . | jq -s .)
+MATCHES_JSON=$(printf '%s\n' "${MATCHES[@]}" | jq -R . | jq -s .)
+HOST_PERMS_JSON=$(printf '%s\n' "${HOST_PERMS[@]}" | jq -R . | jq -s .)
+
+# Update manifest.json safely using jq
+jq \
+  --argjson js "$JS_JSON" \
+  --argjson matches "$MATCHES_JSON" \
+  --argjson host_perms "$HOST_PERMS_JSON" \
+  '.content_scripts[0].js = $js | .content_scripts[0].matches = $matches | .host_permissions = $host_perms' \
+  "$MANIFEST" > "manifest.tmp.json"
+
+mv "manifest.tmp.json" "$MANIFEST"
+
+echo "✅ manifest.json successfully updated with modules from $MODULES_DIR/"
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: HOWTO_add_new_LLM_model.md'
+mkdir -p "$(dirname "HOWTO_add_new_LLM_model.md")"
+rm -f "HOWTO_add_new_LLM_model.md"
+cat  >> "HOWTO_add_new_LLM_model.md" << 'EOF_ARCHIVE_CHUNK'
+# How to add a new LLM model
+
+I am building a Chromium extension that logs LLM chats. I need you to generate a new modular content script file for [INSERT LLM NAME] (URL: [INSERT LLM URL]).
+
+Please write the file following this exact format and structure. The file must start with the @match and @host_permissions comments so my build script can parse them. It must use an IIFE to attach itself to the `window.ForensicModules` namespace.
+
+The module must export two functions:
+1. `match(host, path)`: returns true if the host/path matches the LLM.
+2. `extract()`: queries the DOM for the latest user prompt, the LLM's thinking text (if applicable), and the LLM's response text. Returns an object: `{ promptText, thinkingText, responseText }`.
+
+Here is an example of the required format for a ChatGPT module:
+
+```javascript
+// @match *://chatgpt.com/*
+// @host_permissions *://chatgpt.com/*
+(function() {
+    const match = (host, path) => host.includes('chatgpt.com');
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptText = lastUserMsg.innerText;
+        let thinkingText = "";
+        const thinkingElement = lastAssistantMsg.querySelector('.whitespace-pre-wrap:has(> .text-gray-500)');
+        if (thinkingElement) thinkingText = thinkingElement.innerText;
+        const responseText = lastAssistantMsg.innerText.replace(thinkingText, '').trim();
+
+        return { promptText, thinkingText, responseText };
+    };
+    window.ForensicModules.chatgpt = { match, extract };
+})();
+```
+
+Please generate the equivalent file for [INSERT LLM NAME]. Use your knowledge of [INSERT LLM NAME]'s DOM structure, or use standard semantic HTML querying to find the most likely containers for user messages and AI responses. Name the module window.ForensicModules.[insert_module_name].
+
+
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: manifest.json'
+mkdir -p "$(dirname "manifest.json")"
+rm -f "manifest.json"
+cat  >> "manifest.json" << 'EOF_ARCHIVE_CHUNK'
+{
+  "manifest_version": 3,
+  "name": "LLM Forensic Logger",
+  "version": "1.26",
+  "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://chatgpt.com/*",
+    "*://chat.openai.com/*",
+    "*://claude.ai/*",
+    "*://duck.ai/*",
+    "*://gemini.google.com/*",
+    "*://*.googleusercontent.com/*",
+    "*://labs.google/fx/tools/flow*",
+    "*://www.google.com/*",
+    "*://*.google.com/*",
+    "*://notebooklm.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "LLM Forensic Logger",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://chatgpt.com/*",
+        "*://chat.openai.com/*",
+        "*://claude.ai/*",
+        "*://duck.ai/*",
+        "*://gemini.google.com/*",
+        "*://*.googleusercontent.com/*",
+        "*://labs.google/fx/tools/flow*",
+        "*://www.google.com/search*",
+        "*://*.google.com/search*",
+        "*://notebooklm.google.com/*"
+      ],
+      "js": [
+        "modules/index.js",
+        "modules/chatgpt.js",
+        "modules/claude.js",
+        "modules/duckai.js",
+        "modules/gemini.js",
+        "modules/google_flow.js",
+        "modules/google-search-ai-logger.js",
+        "modules/notebooklm.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: options.html'
+mkdir -p "$(dirname "options.html")"
+rm -f "options.html"
+cat  >> "options.html" << 'EOF_ARCHIVE_CHUNK'
+<!DOCTYPE html>
+<html>
+<head><title>Forensic Logger Settings</title></head>
+<body style="font-family: sans-serif; padding: 20px;">
+  <h2>Forensic Logger Configuration</h2>
+  <p>Since browser extensions cannot run bash commands, please enter your hostname:</p>
+  <label>Hostname (equivalent to <code>uname -n | cut -d. -f1</code>):</label>
+  <input type="text" id="hostname" style="margin-left: 10px;" />
+  <button id="save">Save</button>
+  <p id="status" style="color: green;"></p>
+</body>
+<script src="options.js"></script>
+</html>
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: options.js'
+mkdir -p "$(dirname "options.js")"
+rm -f "options.js"
+cat  >> "options.js" << 'EOF_ARCHIVE_CHUNK'
+document.addEventListener('DOMContentLoaded', () => {
+  chrome.storage.local.get(['hostname'], (result) => {
+    if (result.hostname) {
+      document.getElementById('hostname').value = result.hostname;
+    }
+  });
+
+  document.getElementById('save').addEventListener('click', () => {
+    const hostname = document.getElementById('hostname').value.trim() || 'unknown-host';
+    chrome.storage.local.set({ hostname: hostname }, () => {
+      const status = document.getElementById('status');
+      status.textContent = 'Saved.';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    });
+  });
+});
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: popup.html'
+mkdir -p "$(dirname "popup.html")"
+rm -f "popup.html"
+cat  >> "popup.html" << 'EOF_ARCHIVE_CHUNK'
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 220px; padding: 10px; font-family: sans-serif; }
+    button { width: 100%; padding: 8px; cursor: pointer; margin-bottom: 5px; }
+    .warning { font-size: 11px; color: #555; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <button id="bulkLog">Log Entire Session</button>
+  <p class="warning">Note: For long chats, scroll to the very top of the conversation before clicking this to ensure all rounds are captured.</p>
+  <p id="status" style="font-size: 12px; color: green;"></p>
+  <script src="popup.js"></script>
+</body>
+</html>
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: popup.js'
+mkdir -p "$(dirname "popup.js")"
+rm -f "popup.js"
+cat  >> "popup.js" << 'EOF_ARCHIVE_CHUNK'
+document.getElementById('bulkLog').addEventListener('click', () => {
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    chrome.tabs.sendMessage(tabs[0].id, { type: 'BULK_LOG_REQUEST' }, (response) => {
+      if (chrome.runtime.lastError) {
+        document.getElementById('status').textContent = "Error: Please refresh the page!";
+        document.getElementById('status').style.color = 'red';
+      } else {
+        document.getElementById('status').textContent = "Extracting... Check downloads.";
+        document.getElementById('status').style.color = 'green';
+      }
+      setTimeout(() => window.close(), 3000);
+    });
+  });
+});
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/chatgpt.js'
+mkdir -p "$(dirname "modules/chatgpt.js")"
+rm -f "modules/chatgpt.js"
+cat  >> "modules/chatgpt.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://chatgpt.com/*
+// @match *://chat.openai.com/*
+// @host_permissions *://chatgpt.com/*
+// @host_permissions *://chat.openai.com/*
+(function() {
+    const match = (host, path) => host.includes('chatgpt.com') || host.includes('chat.openai.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // ChatGPT reasoning/thinking blocks
+        const thinkingElement = lastAssistantMsg.querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove(); 
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+                if (thinkingElement) {
+                    thinkingHtml = cleanNode(thinkingElement);
+                }
+                responseHtml = cleanNode(assistantMessages[i]);
+            }
+
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.chatgpt = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/claude.js'
+mkdir -p "$(dirname "modules/claude.js")"
+rm -f "modules/claude.js"
+cat  >> "modules/claude.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://claude.ai/*
+// @host_permissions *://claude.ai/*
+(function() {
+    const match = (host, path) => host.includes('claude.ai');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-testid="user-message"]');
+        const assistantMessages = document.querySelectorAll('.font-claude-message');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // Claude thinking blocks often have this background or a specific testid
+        const thinkingElement = lastAssistantMsg.querySelector('.bg-gray-100, [class*="thinking"], [data-testid="thinking"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove();
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-testid="user-message"]');
+        const assistantMessages = document.querySelectorAll('.font-claude-message');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.bg-gray-100, [class*="thinking"], [data-testid="thinking"]');
+                if (thinkingElement) {
+                    thinkingHtml = cleanNode(thinkingElement);
+                }
+                responseHtml = cleanNode(assistantMessages[i]);
+            }
+
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.claude = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/duckai.js'
+mkdir -p "$(dirname "modules/duckai.js")"
+rm -f "modules/duckai.js"
+cat  >> "modules/duckai.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://duck.ai/*
+// @host_permissions *://duck.ai/*
+(function() {
+    const match = (host, path) => host.includes('duck.ai');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('article[data-testid^="user-message"], .msg__user');
+        const assistantMessages = document.querySelectorAll('article[data-testid^="assistant-message"], .msg__assistant');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('article[data-testid^="user-message"], .msg__user');
+        const assistantMessages = document.querySelectorAll('article[data-testid^="assistant-message"], .msg__assistant');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.duckai = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/gemini.js'
+mkdir -p "$(dirname "modules/gemini.js")"
+rm -f "modules/gemini.js"
+cat  >> "modules/gemini.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://gemini.google.com/*
+// @match *://*.googleusercontent.com/*
+// @host_permissions *://gemini.google.com/*
+// @host_permissions *://*.googleusercontent.com/*
+(function() {
+    const match = (host, path) => host.includes('gemini.google.com');
+
+    const cleanNode = (node) => {
+        if (!node) return "";
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button[aria-label="Copy"], button[aria-label="Listen"], button[aria-label="Share"], button[aria-label="Edit"], button[aria-label="Good response"], button[aria-label="Bad response"], button[aria-label="Generate more"]').forEach(el => el.remove());
+        return clone.outerHTML || clone.innerHTML; 
+    };
+
+    const rawClone = (node) => {
+        if (!node) return "";
+        return node.cloneNode(true).outerHTML;
+    };
+
+    // FIX: Smarter session name extraction
+    const getSessionName = () => {
+        // Look for the active/selected conversation in the sidebar
+        const activeItem = document.querySelector('.chat-history-item-selected, [aria-current="page"] .conversation-title, [data-test-id="conversation-title"]');
+        if (activeItem && activeItem.innerText.trim() && !activeItem.innerText.includes("Flash")) {
+            return activeItem.innerText.trim();
+        }
+        
+        // Fallback: Use the very first user prompt as the title
+        const firstPrompt = document.querySelector('user-query-content, user-query, .query-text');
+        if (firstPrompt && firstPrompt.innerText.trim()) {
+            const text = firstPrompt.innerText.trim().replace(/\n/g, ' ');
+            return text.length > 50 ? text.substring(0, 50) + "..." : text;
+        }
+        
+        return "Untitled Gemini Session";
+    };
+
+    const extractMetadata = (node) => {
+        if (!node) return {};
+        const metadata = { messageIds: [], testIds: [], citations: [] };
+        
+        const idEls = node.querySelectorAll('[data-message-id], [data-id]:not(script)');
+        idEls.forEach(el => {
+            const id = el.getAttribute('data-message-id') || el.getAttribute('data-id');
+            if (id && !metadata.messageIds.includes(id)) metadata.messageIds.push(id);
+        });
+
+        const testEls = node.querySelectorAll('[data-test-id]');
+        testEls.forEach(el => {
+            const testId = el.getAttribute('data-test-id');
+            if (testId && !metadata.testIds.includes(testId)) metadata.testIds.push(testId);
+        });
+
+        const citeEls = node.querySelectorAll('[data-provenance], [data-citation]');
+        citeEls.forEach(el => {
+            const cite = el.getAttribute('data-provenance') || el.getAttribute('data-citation');
+            const link = el.href || (el.closest('a') ? el.closest('a').href : null);
+            if (cite && !metadata.citations.some(c => c.id === cite)) {
+                metadata.citations.push({ id: cite, url: link });
+            }
+        });
+        return metadata;
+    };
+
+    // FIX: Traverse in strict DOM order, no visual sorting
+    const getTurns = () => {
+        const allEls = Array.from(document.querySelectorAll('user-query, model-response'));
+        const validTurns = [];
+        let currentTurn = document.createElement('div');
+        
+        for (let el of allEls) {
+            const isUser = el.tagName.toLowerCase() === 'user-query';
+            if (isUser) {
+                // If we already have content, push the previous turn
+                if (currentTurn.children.length > 0) {
+                    validTurns.push(currentTurn);
+                }
+                // Start a new turn
+                currentTurn = document.createElement('div');
+                currentTurn.appendChild(el.cloneNode(true));
+            } else {
+                // It's a model response, add to current turn
+                currentTurn.appendChild(el.cloneNode(true));
+            }
+        }
+        // Push the final turn
+        if (currentTurn.children.length > 0) validTurns.push(currentTurn);
+        
+        return validTurns;
+    };
+
+    const extract = () => {
+        const turns = getTurns();
+        const lastTurn = turns[turns.length - 1];
+        if (!lastTurn) return null;
+
+        const userEl = lastTurn.querySelector('user-query-content, user-query, .query-text');
+        const modelEl = lastTurn.querySelector('message-content, model-response, .response-container');
+
+        return {
+            promptHtml: cleanNode(userEl),
+            thinkingHtml: "",
+            responseHtml: cleanNode(modelEl),
+            roundHtml: rawClone(lastTurn),
+            metadata: extractMetadata(lastTurn)
+        };
+    };
+
+    const bulkExtract = () => {
+        const turns = getTurns();
+        const rounds = [];
+        for (let turn of turns) {
+            const userEl = turn.querySelector('user-query-content, user-query, .query-text');
+            const modelEl = turn.querySelector('message-content, model-response, .response-container');
+
+            const promptHtml = cleanNode(userEl);
+            const responseHtml = cleanNode(modelEl);
+            const roundHtml = rawClone(turn);
+
+            if (promptHtml || responseHtml || roundHtml) {
+                rounds.push({ 
+                    promptHtml, 
+                    thinkingHtml: "", 
+                    responseHtml, 
+                    roundHtml,
+                    metadata: extractMetadata(turn)
+                });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.gemini = { match, extract, bulkExtract, getSessionName };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/google_flow.js'
+mkdir -p "$(dirname "modules/google_flow.js")"
+rm -f "modules/google_flow.js"
+cat  >> "modules/google_flow.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://labs.google/fx/tools/flow*
+// @host_permissions *://labs.google/fx/tools/flow*
+(function() {
+    const match = (host, path) => host.includes('labs.google') && path.includes('fx/tools/flow');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const promptArea = document.querySelector('textarea, input[type="text"]');
+        if (!promptArea) return null;
+
+        const promptHtml = `<p>${promptArea.value || promptArea.innerText}</p>`;
+        let responseHtml = "";
+
+        const creationBlocks = document.querySelectorAll('[class*="creation"], [class*="result"], [class*="generation"], [class*="asset"]');
+        if (creationBlocks.length > 0) {
+            const lastBlock = creationBlocks[creationBlocks.length - 1];
+            responseHtml = cleanNode(lastBlock);
+        } else {
+            responseHtml = "<p>[Video generation initiated/completed - No extractable text metadata found]</p>";
+        }
+
+        return { promptHtml, thinkingHtml: "", responseHtml };
+    };
+
+    const bulkExtract = () => {
+        // Flow typically only shows the latest generation on screen
+        const data = extract();
+        return data ? [data] : [];
+    };
+
+    window.ForensicModules.google_flow = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/google-search-ai-logger.js'
+mkdir -p "$(dirname "modules/google-search-ai-logger.js")"
+rm -f "modules/google-search-ai-logger.js"
+cat  >> "modules/google-search-ai-logger.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://www.google.com/search*
+// @match *://*.google.com/search*
+// @host_permissions *://www.google.com/*
+// @host_permissions *://*.google.com/*
+// @run_at document_idle
+
+/**
+ * google-search-ai-logger.js
+ */
+
+(() => {
+  'use strict';
+
+  const MODULE_NAME = 'google-search-ai';
+  const BUTTON_LABEL = 'Log Entire Session';
+  const BUTTON_ID = 'forensic-log-session-btn';
+
+  const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'svg', 'path', 'img', 'br', 'hr', 'input', 'button']);
+
+  // ─── Page Detection (content-based, not just URL) ───
+
+  function shouldActivate() {
+    // Method 1: URL parameter (fast, works for live AI Mode)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('udm') === '50' || params.get('udm') === '14') return 'url_param';
+
+    // Method 2: Actual content on the page
+    // (works for saved sessions that might have different URLs)
+    const section = document.querySelector('section');
+    if (!section) return false;
+
+    // Count external citation links — only AI responses have these
+    const links = section.querySelectorAll('a[href]');
+    let extCount = 0;
+    for (const link of links) {
+      const href = link.getAttribute('href') || '';
+      if (href.startsWith('http') && !href.includes('google.com')) extCount++;
+      if (href.startsWith('/url?')) extCount++;
+    }
+
+    if (extCount >= 3) return 'content_detected';
+    return false;
+  }
+
+  function parseUrl() {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      query: params.get('q') || '',
+      searchId: params.get('ei') || '',
+      udm: params.get('udm') || '',
+    };
+  }
+
+  // ─── Find the actual AI response area ───
+
+  // ─── AI Chat Thread Detection ───
+
+  // From DOM diagnostic:
+  //   Section: 141K (whole page)
+  //   Main content: 141K, 12 children (search results + chat + sidebar)
+  //   Chat thread: 87K, 4 children (just the AI conversation)
+  //   Search results: 11 smaller containers totaling ~54K
+  //
+  // Strategy: find the div within the section that's in the 50K-100K
+  // range with 2-10 children. That's uniquely the chat thread.
+
+  function findAiChatThread() {
+    const section = document.querySelector('section');
+    if (!section) {
+      for (const c of [document.querySelector('#search'), document.querySelector('#rso'), document.querySelector('main')]) {
+        if (c && c.children.length > 0) return c;
+      }
+      return null;
+    }
+
+    let chatThread = null;
+    let bestLen = 0;
+
+    section.querySelectorAll('div').forEach(el => {
+      const t = (el.textContent || '').trim().length;
+      const c = el.children.length;
+
+      // Chat thread: large text (50K-100K) but not whole page (<120K)
+      // Few children (2-10) — not 12+ like the results container
+      if (t >= 50000 && t < 120000 && c >= 2 && c <= 10) {
+        if (t > bestLen) {
+          bestLen = t;
+          chatThread = el;
+        }
+      }
+    });
+
+    if (chatThread) {
+      console.log(`[${MODULE_NAME}] Found AI chat thread: <${chatThread.tagName}> textLen=${bestLen} children=${chatThread.children.length}`);
+      // Show what the 4 children look like (the chat turns)
+      for (let i = 0; i < Math.min(chatThread.children.length, 8); i++) {
+        const child = chatThread.children[i];
+        const len = (child.textContent || '').trim().length;
+        console.log(`[${MODULE_NAME}]   Turn [${i}]: <${child.tagName}> class="${(child.className||'').substring(0,40)}" textLen=${len} preview="${(child.textContent||'').trim().substring(0,60)}"`);
+      }
+      return chatThread;
+    }
+
+    console.log(`[${MODULE_NAME}] No chat thread found, using section`);
+    return section;
+  }
+
+  function commonAncestor(a, b) {
+    const set = new Set();
+    let n = a;
+    while (n) { set.add(n); n = n.parentElement; }
+    n = b;
+    while (n) { if (set.has(n)) return n; n = n.parentElement; }
+    return null;
+  }
+
+  // ─── Text Extraction ───
+
+  function getCleanText(element) {
+    let result = '';
+    let nodeCount = 0;
+
+    function walk(el) {
+      if (nodeCount > 50000) return;
+      if (SKIP_TAGS.has(el.tagName?.toLowerCase())) return;
+
+      const role = el.getAttribute('role');
+      if (role && /^(navigation|complementary|search|banner|toolbar|tablist)$/.test(role)) return;
+      if (el.getAttribute('aria-hidden') === 'true') return;
+      const ariaLabel = el.getAttribute('aria-label') || '';
+      if (/history|sidebar|close|menu|manage/i.test(ariaLabel)) return;
+
+      for (const child of el.childNodes) {
+        nodeCount++;
+        if (child.nodeType === 3) {
+          const t = child.textContent;
+          if (t && t.trim()) result += t;
+        } else if (child.nodeType === 1) {
+          walk(child);
+        }
+      }
+    }
+
+    walk(element);
+    return result.replace(/\s{2,}/g, ' ').trim();
+  }
+
+  // ─── Citations ───
+
+  function extractCitationsFrom(container) {
+    const citations = [];
+    const seenUrls = new Set();
+    const links = container.querySelectorAll('a[href]');
+    for (const link of links) {
+      const href = link.getAttribute('href') || '';
+      const url = unwrapUrl(href);
+      if (!url || url.includes('google.com')) continue;
+      if (!seenUrls.has(url)) {
+        seenUrls.add(url);
+        citations.push({ title: (link.textContent || '').trim().substring(0, 80), url: url });
+      }
+    }
+    return citations;
+  }
+
+  function unwrapUrl(href) {
+    if (href.startsWith('/url?') || href.startsWith('/aclk')) {
+      try {
+        const params = new URLSearchParams(href.substring(href.indexOf('?')));
+        return decodeURIComponent(params.get('q') || params.get('url') || href);
+      } catch { return href; }
+    }
+    if (href.startsWith('http')) return href;
+    return '';
+  }
+
+  // ─── Save with fallback ───
+
+  function saveData(key, data) {
+    try {
+      if (chrome?.runtime?.id) {
+        chrome.storage.local.set({ [key]: data }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'forensic_log_entry', entry: data }).catch(() => {});
+        return 'extension';
+      }
+    } catch {}
+    try {
+      localStorage.setItem(key, JSON.stringify(data));
+      return 'localStorage';
+    } catch (e) {
+      return 'failed';
+    }
+  }
+
+  // ─── Noise Removal (applied after extraction) ───
+
+  function cleanExtractedText(rawText) {
+    // The sidebar content appears verbatim multiple times.
+    // Real AI content is unique. Strategy: split into segments,
+    // drop duplicates and known UI labels.
+
+    if (rawText.length < 5000) return rawText; // short text is probably clean
+
+    // Split into sentence-level segments
+    const segments = rawText.match(/[^.!?]+[.!?]+/g) || [];
+    if (segments.length === 0) return rawText; // couldn't split, return raw
+
+    const seen = {};
+    const kept = [];
+
+    for (const seg of segments) {
+      const key = seg.trim();
+      if (key.length < 10) {
+        // Skip tiny fragments unless they look like content
+        if (/^\d+$/.test(key) || /^[,;:-]$/.test(key)) continue;
+        kept.push(key);
+        continue;
+      }
+      if (!seen[key]) {
+        seen[key] = 1;
+        kept.push(key);
+      }
+      // Duplicates are dropped (UI chrome repeats, content doesn't)
+    }
+
+    // Remove known UI label strings
+    const uiLabels = [
+      'AI Mode history', 'New thread', 'Close sidebar',
+      'Search threads', 'Manage public links', 'See my AI Mode history',
+      'Copy', 'Share', 'Feedback', 'Expand', 'Collapse',
+      'Open sidebar', 'Close', 'More', 'Report',
+    ];
+
+    const filtered = kept.filter(seg => {
+      const trimmed = seg.trim();
+      return !uiLabels.some(label => trimmed === label || trimmed.startsWith(label + ' '));
+    });
+
+    let cleaned = filtered.join(' ').replace(/\s{2,}/g, ' ').trim();
+
+    // Final pass: remove any remaining long runs of short label-like fragments
+    // (e.g. "New thread Close sidebar Search threads Manage public links")
+    cleaned = cleaned.replace(
+      /(New thread|Close sidebar|Search threads|Manage public links|AI Mode history|See my AI Mode history|Copy|Share|Feedback)[\s]+/gi,
+      ''
+    ).replace(/\s{2,}/g, ' ').trim();
+
+    return cleaned;
+  }
+
+  // ─── Extraction ───
+
+  function extractSession() {
+    console.log(`[${MODULE_NAME}] === EXTRACTION START ===`);
+    const urlData = parseUrl();
+
+    const responseArea = findAiChatThread();
+    if (!responseArea) {
+      console.log(`[${MODULE_NAME}] No response area found`);
+      return null;
+    }
+
+    // Compare section full text vs response area text
+    const section = document.querySelector('section');
+    const sectionLen = section ? getCleanText(section).length : 0;
+
+
+    let rawText = responseArea ? getCleanText(responseArea) : '';
+    console.log(`[${MODULE_NAME}] Response area raw text: ${rawText.length} chars`);
+
+    console.log(`[${MODULE_NAME}] Cleaning UI noise...`);
+    let responseText = cleanExtractedText(rawText);
+    console.log(`[${MODULE_NAME}] Cleaned text: ${responseText.length} chars (removed ${rawText.length - responseText.length})`);
+
+
+    let aiText = getCleanText(responseArea);
+    if (urlData.query && aiText.startsWith(urlData.query)) {
+      aiText = aiText.substring(urlData.query.length).trim();
+    }
+
+    const citations = extractCitationsFrom(responseArea);
+    console.log(`[${MODULE_NAME}] Citations: ${citations.length}`);
+    console.log(`[${MODULE_NAME}] Preview:`, aiText.substring(0, 300));
+
+    const messages = [];
+    if (urlData.query) messages.push({ role: 'user', content: urlData.query, citations: [] });
+    if (aiText) messages.push({ role: 'ai', content: aiText, citations: citations });
+
+    return {
+      module: MODULE_NAME,
+      event_type: 'session_log',
+      timestamp: Date.now(),
+      search_id: urlData.searchId,
+      url: window.location.href,
+      query: urlData.query,
+      udm: urlData.udm,
+      conversation: messages,
+      sources: citations,
+    };
+  }
+
+  // ─── Button ───
+
+  function injectButton() {
+    if (document.getElementById(BUTTON_ID)) return;
+
+    const btn = document.createElement('button');
+    btn.id = BUTTON_ID;
+    btn.textContent = BUTTON_LABEL;
+    btn.style.cssText = `
+      position: fixed; bottom: 20px; right: 20px;
+      padding: 10px 18px; background: #1a73e8; color: white;
+      border: none; border-radius: 8px; font-size: 14px;
+      font-weight: 600; cursor: pointer; z-index: 999999;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    `;
+    btn.addEventListener('mouseenter', () => btn.style.background = '#1557b0');
+    btn.addEventListener('mouseleave', () => btn.style.background = '#1a73e8');
+    btn.addEventListener('click', handleLogClick);
+
+    document.body.appendChild(btn);
+    console.log(`[${MODULE_NAME}] Button injected`);
+  }
+
+  function handleLogClick() {
+    const btn = document.getElementById(BUTTON_ID);
+    btn.textContent = 'Capturing...';
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+
+    try {
+      const sessionData = extractSession();
+
+      if (!sessionData || sessionData.conversation.length === 0) {
+        throw new Error('No AI conversation content found on this page');
+      }
+
+      const aiMsg = sessionData.conversation.find(m => m.role === 'ai');
+      const charCount = aiMsg?.content?.length || 0;
+
+      const key = `search_ai_${sessionData.search_id || 'unknown'}_${sessionData.timestamp}`;
+      const where = saveData(key, sessionData);
+
+      if (where === 'extension') {
+        btn.textContent = `Logged ✓ ${charCount} chars, ${sessionData.sources.length} sources`;
+        btn.style.background = '#34a853';
+      } else if (where === 'localStorage') {
+        btn.textContent = `Saved (localStorage) ✓ ${charCount} chars`;
+        btn.style.background = '#f9a825';
+      } else {
+        btn.textContent = `Captured ${charCount} chars — save failed`;
+        btn.style.background = '#ea4335';
+      }
+
+    } catch (err) {
+      btn.textContent = `Error: ${err.message}`;
+      btn.style.background = '#ea4335';
+      console.log(`[${MODULE_NAME}] FAILED:`, err);
+    }
+
+    setTimeout(() => {
+      btn.textContent = BUTTON_LABEL;
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.style.background = '#1a73e8';
+    }, 5000);
+  }
+
+  // ─── Init ───
+
+  // ─── Init ───
+
+  function init() {
+    console.log(`[${MODULE_NAME}] init() called. URL: ${window.location.href.substring(0, 80)}`);
+
+    const reason = shouldActivate();
+    if (!reason) {
+      console.log(`[${MODULE_NAME}] No AI content detected, skipping`);
+      return;
+    }
+
+    console.log(`[${MODULE_NAME}] AI content detected (${reason})`);
+    injectButton();
+  }
+
+  // Initial run after page settles
+  if (document.readyState === 'complete') {
+    setTimeout(init, 3000);
+  } else {
+    window.addEventListener('load', () => setTimeout(init, 3000));
+  }
+
+  // ─── Persistent re-injection ───
+  // Google's SPA rebuilds the DOM, destroying injected elements.
+  // Periodically check and re-inject if the button disappeared.
+
+  setInterval(() => {
+    if (shouldActivate() && !document.getElementById(BUTTON_ID)) {
+      console.log(`[${MODULE_NAME}] Button lost from DOM, re-injecting`);
+      injectButton();
+    }
+  }, 5000);
+
+  // MutationObserver for late-rendering content — do NOT disconnect
+  let observerRetry = 0;
+  new MutationObserver(() => {
+    if (!document.getElementById(BUTTON_ID) && observerRetry < 30 && shouldActivate()) {
+      observerRetry++;
+      setTimeout(init, 2000);
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/index.js'
+mkdir -p "$(dirname "modules/index.js")"
+rm -f "modules/index.js"
+cat  >> "modules/index.js" << 'EOF_ARCHIVE_CHUNK'
+// Initialize the global namespace for modular LLM handlers
+window.ForensicModules = {};
+EOF_ARCHIVE_CHUNK
+echo 'Extracting: modules/notebooklm.js'
+mkdir -p "$(dirname "modules/notebooklm.js")"
+rm -f "modules/notebooklm.js"
+cat  >> "modules/notebooklm.js" << 'EOF_ARCHIVE_CHUNK'
+// @match *://notebooklm.google.com/*
+// @host_permissions *://notebooklm.google.com/*
+(function() {
+    const match = (host, path) => host.includes('notebooklm.google.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.notebooklm = { match, extract, bulkExtract };
+})();
+EOF_ARCHIVE_CHUNK
+echo 'Payload successfully unpacked.'
+exit 0
+
+```
+
+
+=== modules/chatgpt.js ===
+
+``
+// @match *://chatgpt.com/*
+// @match *://chat.openai.com/*
+// @host_permissions *://chatgpt.com/*
+// @host_permissions *://chat.openai.com/*
+(function() {
+    const match = (host, path) => host.includes('chatgpt.com') || host.includes('chat.openai.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // ChatGPT reasoning/thinking blocks
+        const thinkingElement = lastAssistantMsg.querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove(); 
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-message-author-role="user"]');
+        const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.whitespace-pre-wrap:has(> .text-gray-500), [class*="reasoning"], [class*="think-block"]');
+                if (thinkingElement) {
+                    thinkingHtml = cleanNode(thinkingElement);
+                }
+                responseHtml = cleanNode(assistantMessages[i]);
+            }
+
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.chatgpt = { match, extract, bulkExtract };
+})();
+
+```
+
+
+=== modules/claude.js ===
+
+``
+// @match *://claude.ai/*
+// @host_permissions *://claude.ai/*
+(function() {
+    const match = (host, path) => host.includes('claude.ai');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"], .copy-button').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('[data-testid="user-message"]');
+        const assistantMessages = document.querySelectorAll('.font-claude-message');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        const promptHtml = cleanNode(lastUserMsg);
+        let thinkingHtml = "";
+        
+        // Claude thinking blocks often have this background or a specific testid
+        const thinkingElement = lastAssistantMsg.querySelector('.bg-gray-100, [class*="thinking"], [data-testid="thinking"]');
+        if (thinkingElement) {
+            thinkingHtml = cleanNode(thinkingElement);
+            thinkingElement.remove();
+        }
+        const responseHtml = cleanNode(lastAssistantMsg);
+
+        return { promptHtml, thinkingHtml, responseHtml };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('[data-testid="user-message"]');
+        const assistantMessages = document.querySelectorAll('.font-claude-message');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = "";
+            let thinkingHtml = "";
+            let responseHtml = "";
+
+            if (userMessages[i]) promptHtml = cleanNode(userMessages[i]);
+
+            if (assistantMessages[i]) {
+                const thinkingElement = assistantMessages[i].querySelector('.bg-gray-100, [class*="thinking"], [data-testid="thinking"]');
+                if (thinkingElement) {
+                    thinkingHtml = cleanNode(thinkingElement);
+                }
+                responseHtml = cleanNode(assistantMessages[i]);
+            }
+
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml, responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.claude = { match, extract, bulkExtract };
+})();
+
+```
+
+
+=== modules/duckai.js ===
+
+``
+// @match *://duck.ai/*
+// @host_permissions *://duck.ai/*
+(function() {
+    const match = (host, path) => host.includes('duck.ai');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('article[data-testid^="user-message"], .msg__user');
+        const assistantMessages = document.querySelectorAll('article[data-testid^="assistant-message"], .msg__assistant');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('article[data-testid^="user-message"], .msg__user');
+        const assistantMessages = document.querySelectorAll('article[data-testid^="assistant-message"], .msg__assistant');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.duckai = { match, extract, bulkExtract };
+})();
+
+```
+
+
+=== modules/gemini.js ===
+
+``
+// @match *://gemini.google.com/*
+// @match *://*.googleusercontent.com/*
+// @host_permissions *://gemini.google.com/*
+// @host_permissions *://*.googleusercontent.com/*
+(function() {
+    const match = (host, path) => host.includes('gemini.google.com');
+
+    const cleanNode = (node) => {
+        if (!node) return "";
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button[aria-label="Copy"], button[aria-label="Listen"], button[aria-label="Share"], button[aria-label="Edit"], button[aria-label="Good response"], button[aria-label="Bad response"], button[aria-label="Generate more"]').forEach(el => el.remove());
+        return clone.outerHTML || clone.innerHTML; 
+    };
+
+    const rawClone = (node) => {
+        if (!node) return "";
+        return node.cloneNode(true).outerHTML;
+    };
+
+    // FIX: Smarter session name extraction
+    const getSessionName = () => {
+        // Look for the active/selected conversation in the sidebar
+        const activeItem = document.querySelector('.chat-history-item-selected, [aria-current="page"] .conversation-title, [data-test-id="conversation-title"]');
+        if (activeItem && activeItem.innerText.trim() && !activeItem.innerText.includes("Flash")) {
+            return activeItem.innerText.trim();
+        }
+        
+        // Fallback: Use the very first user prompt as the title
+        const firstPrompt = document.querySelector('user-query-content, user-query, .query-text');
+        if (firstPrompt && firstPrompt.innerText.trim()) {
+            const text = firstPrompt.innerText.trim().replace(/\n/g, ' ');
+            return text.length > 50 ? text.substring(0, 50) + "..." : text;
+        }
+        
+        return "Untitled Gemini Session";
+    };
+
+    const extractMetadata = (node) => {
+        if (!node) return {};
+        const metadata = { messageIds: [], testIds: [], citations: [] };
+        
+        const idEls = node.querySelectorAll('[data-message-id], [data-id]:not(script)');
+        idEls.forEach(el => {
+            const id = el.getAttribute('data-message-id') || el.getAttribute('data-id');
+            if (id && !metadata.messageIds.includes(id)) metadata.messageIds.push(id);
+        });
+
+        const testEls = node.querySelectorAll('[data-test-id]');
+        testEls.forEach(el => {
+            const testId = el.getAttribute('data-test-id');
+            if (testId && !metadata.testIds.includes(testId)) metadata.testIds.push(testId);
+        });
+
+        const citeEls = node.querySelectorAll('[data-provenance], [data-citation]');
+        citeEls.forEach(el => {
+            const cite = el.getAttribute('data-provenance') || el.getAttribute('data-citation');
+            const link = el.href || (el.closest('a') ? el.closest('a').href : null);
+            if (cite && !metadata.citations.some(c => c.id === cite)) {
+                metadata.citations.push({ id: cite, url: link });
+            }
+        });
+        return metadata;
+    };
+
+    // FIX: Traverse in strict DOM order, no visual sorting
+    const getTurns = () => {
+        const allEls = Array.from(document.querySelectorAll('user-query, model-response'));
+        const validTurns = [];
+        let currentTurn = document.createElement('div');
+        
+        for (let el of allEls) {
+            const isUser = el.tagName.toLowerCase() === 'user-query';
+            if (isUser) {
+                // If we already have content, push the previous turn
+                if (currentTurn.children.length > 0) {
+                    validTurns.push(currentTurn);
+                }
+                // Start a new turn
+                currentTurn = document.createElement('div');
+                currentTurn.appendChild(el.cloneNode(true));
+            } else {
+                // It's a model response, add to current turn
+                currentTurn.appendChild(el.cloneNode(true));
+            }
+        }
+        // Push the final turn
+        if (currentTurn.children.length > 0) validTurns.push(currentTurn);
+        
+        return validTurns;
+    };
+
+    const extract = () => {
+        const turns = getTurns();
+        const lastTurn = turns[turns.length - 1];
+        if (!lastTurn) return null;
+
+        const userEl = lastTurn.querySelector('user-query-content, user-query, .query-text');
+        const modelEl = lastTurn.querySelector('message-content, model-response, .response-container');
+
+        return {
+            promptHtml: cleanNode(userEl),
+            thinkingHtml: "",
+            responseHtml: cleanNode(modelEl),
+            roundHtml: rawClone(lastTurn),
+            metadata: extractMetadata(lastTurn)
+        };
+    };
+
+    const bulkExtract = () => {
+        const turns = getTurns();
+        const rounds = [];
+        for (let turn of turns) {
+            const userEl = turn.querySelector('user-query-content, user-query, .query-text');
+            const modelEl = turn.querySelector('message-content, model-response, .response-container');
+
+            const promptHtml = cleanNode(userEl);
+            const responseHtml = cleanNode(modelEl);
+            const roundHtml = rawClone(turn);
+
+            if (promptHtml || responseHtml || roundHtml) {
+                rounds.push({ 
+                    promptHtml, 
+                    thinkingHtml: "", 
+                    responseHtml, 
+                    roundHtml,
+                    metadata: extractMetadata(turn)
+                });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.gemini = { match, extract, bulkExtract, getSessionName };
+})();
+
+```
+
+
+=== modules/google_flow.js ===
+
+``
+// @match *://labs.google/fx/tools/flow*
+// @host_permissions *://labs.google/fx/tools/flow*
+(function() {
+    const match = (host, path) => host.includes('labs.google') && path.includes('fx/tools/flow');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const promptArea = document.querySelector('textarea, input[type="text"]');
+        if (!promptArea) return null;
+
+        const promptHtml = `<p>${promptArea.value || promptArea.innerText}</p>`;
+        let responseHtml = "";
+
+        const creationBlocks = document.querySelectorAll('[class*="creation"], [class*="result"], [class*="generation"], [class*="asset"]');
+        if (creationBlocks.length > 0) {
+            const lastBlock = creationBlocks[creationBlocks.length - 1];
+            responseHtml = cleanNode(lastBlock);
+        } else {
+            responseHtml = "<p>[Video generation initiated/completed - No extractable text metadata found]</p>";
+        }
+
+        return { promptHtml, thinkingHtml: "", responseHtml };
+    };
+
+    const bulkExtract = () => {
+        // Flow typically only shows the latest generation on screen
+        const data = extract();
+        return data ? [data] : [];
+    };
+
+    window.ForensicModules.google_flow = { match, extract, bulkExtract };
+})();
+
+```
+
+
+=== modules/google-search-ai-logger.js ===
+
+``
+// @match *://www.google.com/search*
+// @match *://*.google.com/search*
+// @host_permissions *://www.google.com/*
+// @host_permissions *://*.google.com/*
+// @run_at document_idle
+
+/**
+ * google-search-ai-logger.js
+ * 
+ * Module for the LLM-Forensic-Logger extension.
+ * Specifically targets Google Search "AI Mode History" sessions.
+ * 
+ * Structural Anchors discovered:
+ *   Container: id="aim-chrome-initial-inline-async-container"
+ *   Turn:      data-scope-id="turn"
+ */
+
+const MODULE_NAME = 'google-search-ai';
+
+// ─── Structural Anchors ───
+const CHAT_CONTAINER_ID = 'aim-chrome-initial-inline-async-container';
+const TURN_SELECTOR = '[data-scope-id="turn"]';
+
+// ─── 1. Container & Turn Detection ───
+
+function getAiChatContainer() {
+  return document.querySelector(`#${CHAT_CONTAINER_ID}`);
+}
+
+function extractAiTurns(container) {
+  if (!container) return [];
+  
+  const turns = Array.from(container.querySelectorAll(TURN_SELECTOR));
+  console.log(`[${MODULE_NAME}] Found ${turns.length} AI Turns in history container.`);
+  
+  return turns;
+}
+
+// ─── 2. Smart DOM Cleaning & Text Extraction ───
+// This replaces the brute-force innerText grab that resulted in 58K+ char bloat.
+// It walks the tree, ignores UI chrome (buttons, svgs, hidden elements), 
+// and captures only visible prose and citation links.
+
+function cleanTurnElement(turnEl) {
+  const proseParts = [];
+  const citations = [];
+
+  // Recursive function to walk the DOM node by node
+  function walkNode(node) {
+    // Skip entire subtrees if they are UI noise
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const tag = node.tagName.toLowerCase();
+      
+      // Ignore buttons, SVGs, scripts, styles, and hidden accessibility spans
+      if (tag === 'button' || tag === 'svg' || tag === 'script' || tag === 'style') return;
+      if (node.getAttribute('aria-hidden') === 'true') return;
+      
+      // If it's a citation link, grab the URL and text, then stop descending
+      if (tag === 'a' && node.href) {
+        const linkText = (node.textContent || '').trim();
+        if (linkText.length > 0 && linkText.length < 100) { // Filter out weird long text links
+          proseParts.push(linkText);
+          citations.push({
+            text: linkText,
+            url: node.href
+          });
+        }
+        return; // Don't descend into links further to avoid duplicate text
+      }
+    }
+
+    // If it's a text node, grab the visible text
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent.trim();
+      if (text.length > 0) {
+        // Filter out known Google UI noise strings
+        if (text !== 'CopiedCopyEdit' && text !== 'Copy' && text !== 'Edit') {
+          proseParts.push(text);
+        }
+      }
+      return;
+    }
+
+    // Recurse into children
+    for (const child of node.childNodes) {
+      walkNode(child);
+    }
+  }
+
+  walkNode(turnEl);
+
+  // Join the prose parts with spaces, cleaning up weird spacing
+  const cleanedText = proseParts.join(' ')
+    .replace(/\s+/g, ' ') // Collapse multiple spaces
+    .trim();
+
+  return {
+    rawLength: (turnEl.textContent || '').trim().length,
+    cleanedLength: cleanedText.length,
+    text: cleanedText,
+    citations: citations
+  };
+}
+
+// ─── 3. Processing & Formatting the Conversation ───
+
+function processConversation(turns) {
+  const conversationLog = [];
+
+  turns.forEach((turnEl, index) => {
+    const cleanedData = cleanTurnElement(turnEl);
+    
+    console.log(`[${MODULE_NAME}]   Turn [${index}]: rawLen=${cleanedData.rawLength} -> cleanedLen=${cleanedData.cleanedLength} citations=${cleanedData.citations.length}`);
+    console.log(`[${MODULE_NAME}]   Turn [${index}] Preview: "${cleanedData.text.substring(0, 120)}..."`);
+
+    conversationLog.push({
+      turnIndex: index,
+      text: cleanedData.text,
+      citations: cleanedData.citations
+      // Note: In a real forensic logger, you might want to detect if this turn 
+      // is a "User Prompt" or an "AI Response" based on sub-elements inside the turn.
+      // For now, we are just extracting the clean text linearly.
+    });
+  });
+
+  return conversationLog;
+}
+
+  // ─── 4. MutationObserver (SPA-Proof) ───
+  // Instead of observing the fragile container, we observe the whole body
+  // and specifically listen for the injection of 'turn' elements.
+
+  function observeForAiTurns() {
+    console.log(`[${MODULE_NAME}] Attaching global SPA Observer to document.body...`);
+
+    const observer = new MutationObserver((mutationsList) => {
+      for (const mutation of mutationsList) {
+        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              
+              // Check if the added node IS a turn, or CONTAINS a turn
+              const isTurn = node.matches(TURN_SELECTOR);
+              const containsTurns = node.querySelector(TURN_SELECTOR);
+
+              if (isTurn || containsTurns) {
+                console.log(`[${MODULE_NAME}] SPA Observer detected AI Turns injected!`);
+                
+                // Disconnect observer temporarily to avoid infinite loops during extraction
+                observer.disconnect();
+
+                // Wait a brief moment for Google's slow UI to finish rendering text
+                setTimeout(() => {
+                  processCurrentHistoryView();
+                  // Re-observe after processing so we catch the NEXT history click
+                  observeForAiTurns();
+                }, 500); 
+
+                return; // Exit the loop, we found our target
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Observe the whole body, subtree true, so we catch injections anywhere on the page
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ─── 5. Processing & Formatting the Conversation ───
+
+  function processCurrentHistoryView() {
+    // Re-query the container and turns fresh (they might be new DOM nodes now)
+    const container = getAiChatContainer();
+    if (!container) {
+      console.log(`[${MODULE_NAME}] Container vanished before processing could begin.`);
+      return;
+    }
+
+    const turns = extractAiTurns(container);
+    if (turns.length === 0) {
+      console.log(`[${MODULE_NAME}] Turns detected, but extraction found 0 elements. DOM might still be loading.`);
+      return;
+    }
+
+    const conversationLog = [];
+
+    turns.forEach((turnEl, index) => {
+      const cleanedData = cleanTurnElement(turnEl);
+      
+      console.log(`[${MODULE_NAME}]   Turn [${index}]: rawLen=${cleanedData.rawLength} -> cleanedLen=${cleanedData.cleanedLength} citations=${cleanedData.citations.length}`);
+      console.log(`[${MODULE_NAME}]   Turn [${index}] Preview: "${cleanedData.text.substring(0, 120)}..."`);
+
+      conversationLog.push({
+        turnIndex: index,
+        text: cleanedData.text,
+        citations: cleanedData.citations
+      });
+    });
+
+    console.log(`[${MODULE_NAME}] Forensic Log Complete. Turns processed: ${conversationLog.length}`);
+    console.log(`[${MODULE_NAME}] Final Log Object:`, conversationLog);
+    
+    // ────── LOG TO EXTENSION STORAGE HERE ──────
+    // chrome.storage.local.set({ googleAiHistory: conversationLog });
+  }
+
+  // ─── 6. Initialization ───
+
+  function init() {
+    console.log(`[${MODULE_NAME}] Initializing Forensic Logger...`);
+    
+    // 1. Check if a history conversation is already fully rendered on the page 
+    // (e.g., if the user refreshed the page while looking at one)
+    const existingTurns = document.querySelectorAll(TURN_SELECTOR);
+    if (existingTurns.length > 0) {
+      console.log(`[${MODULE_NAME}] Found ${existingTurns.length} existing Turns on page load. Processing immediately.`);
+      processCurrentHistoryView();
+      // We still start the observer so we catch it if they click a different history item
+      observeForAiTurns();
+    } else {
+      // 2. If no turns exist yet, start the observer to wait for the user to click one
+      observeForAiTurns();
+    }
+  }
+
+  // Run initialization
+  init();
+
+```
+
+
+=== modules/index.js ===
+
+``
+// Initialize the global namespace for modular LLM handlers
+window.ForensicModules = {};
+
+```
+
+
+=== modules/notebooklm.js ===
+
+``
+// @match *://notebooklm.google.com/*
+// @host_permissions *://notebooklm.google.com/*
+(function() {
+    const match = (host, path) => host.includes('notebooklm.google.com');
+    
+    const cleanNode = (node) => {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('button, svg, [class*="icon"]').forEach(el => el.remove());
+        return clone.innerHTML;
+    };
+
+    const extract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const lastUserMsg = userMessages[userMessages.length - 1];
+        const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+        if (!lastUserMsg || !lastAssistantMsg) return null;
+
+        return { 
+            promptHtml: cleanNode(lastUserMsg), 
+            thinkingHtml: "", 
+            responseHtml: cleanNode(lastAssistantMsg) 
+        };
+    };
+
+    const bulkExtract = () => {
+        const userMessages = document.querySelectorAll('.chat-message-user, .user-query');
+        const assistantMessages = document.querySelectorAll('.chat-message-model, .model-response');
+        const rounds = [];
+        const maxRounds = Math.max(userMessages.length, assistantMessages.length);
+        
+        for (let i = 0; i < maxRounds; i++) {
+            let promptHtml = userMessages[i] ? cleanNode(userMessages[i]) : "";
+            let responseHtml = assistantMessages[i] ? cleanNode(assistantMessages[i]) : "";
+            if (promptHtml || responseHtml) {
+                rounds.push({ promptHtml, thinkingHtml: "", responseHtml });
+            }
+        }
+        return rounds;
+    };
+
+    window.ForensicModules.notebooklm = { match, extract, bulkExtract };
+})();
+
+```
+
+
