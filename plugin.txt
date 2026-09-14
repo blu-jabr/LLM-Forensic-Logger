@@ -1,12 +1,20 @@
 #!/bin/bash
 # Self-extracting archive generated via Bootstrap Protocol
 # Execute this script to extract contents to the current directory.
-
 echo 'Extracting: background.js'
 mkdir -p "$(dirname "background.js")"
 rm -f "background.js"
 cat  >> "background.js" << 'EOF_ARCHIVE_CHUNK'
 console.log("[Forensic Logger] New background.js loaded successfully.");
+
+// ─── Configuration ───
+const EMIT_ROLLING_STATE = true;    // write a state snapshot JSON after every round
+const HEDGING_FLAG_THRESHOLD = 3;   // hedging_language_count >= this flags a round for priority review
+const MAX_STORED_ROUNDS = 500;      // safety valve for the in-extension transcript packet
+const MAX_CODE_BLOCKS_IN_STATE = 8;
+const CODE_BLOCK_EXCERPT_CHARS = 1600;
+const PROMPT_EXCERPT_CHARS = 200;
+const HANDOFF_SCHEMA_VERSION = 1;
 
 let isProcessing = false;
 const logQueue = [];
@@ -19,30 +27,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.type === 'BULK_LOG_SESSION') {
     const { rounds, sessionName, chatId } = message.payload;
     console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
-    
-    // ADD THIS: Reset the sequence number for this chat to 0 before queueing
+
     if (chatId) {
-      getSessionState(chatId, true).then(() => {
-        rounds.forEach((roundData) => {
-          const payload = {
-            prompt: roundData.prompt,
-            thinking: roundData.thinking || "",
-            response: roundData.response,
-            mediaFiles: roundData.mediaFiles || [],
-            roundHtml: roundData.roundHtml || "",
-            sessionName: sessionName || "Untitled Session",
-            metadata: roundData.metadata || {},
-            chatId: chatId, // Pass chatId in payload
-            generationDurationMs: 0,
-            domNodeCount: 0,
-            origin: sender.tab ? sender.tab.url : 'unknown'
-          };
-          logQueue.push({ payload, isBulk: true });
+      // Reset the packet first, so the bulk replay rebuilds it cleanly
+      resetSessionPacket(chatId)
+        .then(() => getSessionState(chatId, true))
+        .then(() => {
+          rounds.forEach((roundData) => {
+            const payload = {
+              prompt: roundData.prompt,
+              thinking: roundData.thinking || "",
+              response: roundData.response,
+              mediaFiles: roundData.mediaFiles || [],
+              roundHtml: roundData.roundHtml || "",
+              sessionName: sessionName || "Untitled Session",
+              metadata: roundData.metadata || {},
+              chatId: chatId,
+              generationDurationMs: 0,
+              domNodeCount: 0,
+              origin: sender.tab ? sender.tab.url : 'unknown'
+            };
+            logQueue.push({ payload, isBulk: true });
+          });
+          processQueue();
         });
-        processQueue();
-      });
     }
     sendResponse({ status: 'success' });
+  } else if (message.type === 'GENERATE_HANDOFF') {
+    generateHandoff(message.chatId)
+      .then(res => sendResponse(res))
+      .catch(e => sendResponse({ status: 'error', error: e.message }));
   }
   return true;
 });
@@ -62,13 +76,12 @@ async function processQueue() {
 async function getSessionState(chatId, shouldReset = false) {
   const data = await chrome.storage.local.get(['sessions']);
   const sessions = data.sessions || {};
-  
+
   if (!sessions[chatId] || shouldReset) {
-    // Generate a NEW Session ID and reset the round number to 0
     sessions[chatId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
     await chrome.storage.local.set({ sessions });
   }
-  
+
   return sessions[chatId];
 }
 
@@ -77,6 +90,45 @@ async function saveSessionState(chatId, state) {
   const sessions = data.sessions || {};
   sessions[chatId] = state;
   await chrome.storage.local.set({ sessions });
+}
+
+// ─── Session Packet (normalized transcript retained for state/handoff engine) ───
+// The authoritative transcript remains the downloaded round files. This packet
+// is a working copy so the handoff can be assembled without re-reading the DOM.
+
+async function resetSessionPacket(chatId) {
+  const data = await chrome.storage.local.get(['sessionPackets']);
+  const packets = data.sessionPackets || {};
+  packets[chatId] = { session_id: null, session_name: null, rounds: [] };
+  await chrome.storage.local.set({ sessionPackets: packets });
+}
+
+async function appendToPacket(chatId, entry) {
+  const data = await chrome.storage.local.get(['sessionPackets']);
+  const packets = data.sessionPackets || {};
+  if (!packets[chatId]) {
+    packets[chatId] = { session_id: null, session_name: null, rounds: [] };
+  }
+  const packet = packets[chatId];
+  if (entry.session_id && !packet.session_id) packet.session_id = entry.session_id;
+  if (entry.session_name) packet.session_name = entry.session_name;
+
+  // Dedupe consecutive identical rounds (live logging can double-fire)
+  const last = packet.rounds[packet.rounds.length - 1];
+  if (!(last && last.prompt === entry.prompt && last.response === entry.response)) {
+    packet.rounds.push(entry);
+  }
+
+  if (packet.rounds.length > MAX_STORED_ROUNDS) {
+    packet.rounds = packet.rounds.slice(-MAX_STORED_ROUNDS);
+  }
+  await chrome.storage.local.set({ sessionPackets: packets });
+  return packet;
+}
+
+async function getPacket(chatId) {
+  const data = await chrome.storage.local.get(['sessionPackets']);
+  return (data.sessionPackets || {})[chatId] || null;
 }
 
 async function logRound(payload, chatId) {
@@ -127,7 +179,264 @@ async function logRound(payload, chatId) {
       }, idx * 200);
     });
   }
+
+  // ── Retain normalized copy + emit rolling state snapshot ──
+  const packetEntry = {
+    round: roundNum,
+    timestamp_utc: jsonContent.timestamp_logged_utc,
+    session_id: state.SESSION_ID,
+    session_name: payload.sessionName || null,
+    prompt: payload.prompt || "",
+    thinking: payload.thinking || "",
+    response: payload.response || "",
+    metrics: jsonContent.metrics,
+    media: (payload.mediaFiles || []).map(m => ({ filename: m.filename, dir: mediaDirName })),
+    files: {
+      md: `${folderPath}${baseFilename}.md`,
+      json: `${folderPath}${baseFilename}.json`,
+      xhtml: `${folderPath}${baseFilename}.xhtml`,
+      media_dir: (payload.mediaFiles && payload.mediaFiles.length > 0) ? `${folderPath}${mediaDirName}` : null
+    }
+  };
+  const packet = await appendToPacket(chatId, packetEntry);
+
+  if (EMIT_ROLLING_STATE) {
+    const stateJson = buildRollingStateJson(state, packet, payload, chatId, HOSTNAME);
+    const stateUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(stateJson, null, 2));
+    const stateFilename = `${folderPath}state.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}.json`;
+    chrome.downloads.download({ url: stateUrl, filename: stateFilename, saveAs: false });
+  }
 }
+
+// ─── Mechanical extraction helpers (no interpretation, regex/counters only) ───
+
+function extractCodeBlocks(md) {
+  const out = [];
+  if (!md) return out;
+  const re = /```([A-Za-z0-9_+#.-]*)[^\S\n]*\n([\s\S]*?)(?:```|$)/g;
+  let m;
+  while ((m = re.exec(md)) !== null) {
+    if (m[2].trim().length === 0) continue;
+    out.push({ language: m[1] || 'text', content: m[2].replace(/\n$/, '') });
+  }
+  return out;
+}
+
+function trailingQuestion(text) {
+  if (!text) return null;
+  const tail = text.trim().slice(-400);
+  const m = tail.match(/([^\n]*\?)\s*$/);
+  return m ? m[1].trim().slice(0, 300) : null;
+}
+
+function computeFlags(metrics) {
+  const d = (metrics && metrics.drift_and_hallucination_indicators) || {};
+  return {
+    self_correction: (d.self_correction_count || 0) > 0,
+    hedging_spike: (d.hedging_language_count || 0) >= HEDGING_FLAG_THRESHOLD
+  };
+}
+
+function excerpt(s, n = PROMPT_EXCERPT_CHARS) {
+  if (!s) return '';
+  const t = s.replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n) + '…' : t;
+}
+
+function buildRollingStateJson(sessionState, packet, payload, chatId, HOSTNAME) {
+  const rounds = packet.rounds;
+  const last = rounds[rounds.length - 1] || null;
+  const codeBlocks = last ? extractCodeBlocks(last.response).slice(0, MAX_CODE_BLOCKS_IN_STATE) : [];
+
+  return {
+    type: 'rolling_state',
+    schema_version: HANDOFF_SCHEMA_VERSION,
+    session_id: sessionState.SESSION_ID,
+    chat_id: chatId,
+    session_name: payload.sessionName || packet.session_name || null,
+    hostname: HOSTNAME,
+    generated_at_utc: new Date().toISOString(),
+    rounds_recorded: rounds.length,
+    highest_round: sessionState.round_number,
+    objective: {
+      session_name: payload.sessionName || packet.session_name || null,
+      first_prompt_excerpt: rounds.length ? excerpt(rounds[0].prompt, 400) : ''
+    },
+    prompt_index: rounds.map(r => ({ round: r.round, excerpt: excerpt(r.prompt) })),
+    latest_code_blocks: codeBlocks.map(b => ({
+      language: b.language,
+      char_count: b.content.length,
+      source_round: last.round,
+      excerpt: b.content.slice(0, CODE_BLOCK_EXCERPT_CHARS),
+      truncated: b.content.length > CODE_BLOCK_EXCERPT_CHARS
+    })),
+    media_manifest: rounds.flatMap(r => (r.media || []).map(m => ({ round: r.round, filename: m.filename, dir: m.dir }))),
+    flagged_rounds: rounds
+      .map(r => ({ round: r.round, ...computeFlags(r.metrics) }))
+      .filter(x => x.self_correction || x.hedging_spike),
+    question_pending_at_round_end: (last && trailingQuestion(last.response))
+      ? { round: last.round, text: trailingQuestion(last.response) }
+      : null,
+    latest_files: last ? last.files : null
+  };
+}
+
+// ─── On-demand handoff (assembly only — never summarization) ───
+
+async function generateHandoff(chatId) {
+  const packet = await getPacket(chatId);
+  if (!packet || packet.rounds.length === 0) {
+    return {
+      status: 'empty',
+      message: 'No recorded rounds for this chat in extension storage. Scroll to top and click "Log Entire Session" to rebuild the packet, then try again.'
+    };
+  }
+
+  const { hostname } = await chrome.storage.local.get(['hostname']);
+  const HOSTNAME = hostname || 'unknown-host';
+
+  const rounds = packet.rounds;
+  const last = rounds[rounds.length - 1];
+  const sessionId = packet.session_id || 'no-session-id';
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+  const seqNum = String(last.round).padStart(8, '0');
+  const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
+  const baseName = `handoff.${sessionId}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+
+  const md = buildHandoffMarkdown({
+    sessionId,
+    sessionName: packet.session_name,
+    chatId,
+    hostname: HOSTNAME,
+    packet
+  });
+
+  const url = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(md);
+  chrome.downloads.download({ url, filename: `${folderPath}${baseName}.md`, saveAs: false });
+
+  return { status: 'success', rounds: rounds.length };
+}
+
+function buildHandoffMarkdown({ sessionId, sessionName, chatId, hostname, packet }) {
+  const rounds = packet.rounds;
+  const last = rounds[rounds.length - 1];
+  const first = rounds[0];
+
+  const flagged = [];
+  for (const r of rounds) {
+    const f = computeFlags(r.metrics);
+    if (f.self_correction || f.hedging_spike) flagged.push({ round: r.round, ...f });
+  }
+
+  const gaps = [];
+  for (let i = 1; i < rounds.length; i++) {
+    if (rounds[i].round !== rounds[i - 1].round + 1) gaps.push(`${rounds[i - 1].round}→${rounds[i].round}`);
+  }
+
+  const L = [];
+  L.push(`# Session Handoff — ${sessionName || sessionId}`);
+  L.push('');
+  L.push(`**Session ID:** \`${sessionId}\`  ·  **Chat:** \`${chatId}\`  ·  **Host:** \`${hostname}\``);
+  L.push(`**Generated:** ${new Date().toISOString()}  ·  **Rounds recorded:** ${rounds.length} (highest round #${last.round})`);
+  L.push('');
+  L.push('> **HOW TO USE (receiving model):** This file was generated mechanically from a lossless transcript — no LLM summarized it.');
+  L.push('> 1. Read this file, then **restate your understanding and ask clarifying questions before doing any work**.');
+  L.push('> 2. This file is a map; the round files it points to are the territory. Pull them when detail matters.');
+  L.push('> 3. Flag apparent inconsistencies instead of silently resolving them.');
+  L.push('');
+
+  L.push('## Objective');
+  L.push('');
+  L.push(`**First prompt (excerpt):** ${excerpt(first.prompt, 400)}`);
+  L.push('');
+
+  if (gaps.length) {
+    L.push('## ⚠ Data gaps');
+    L.push('');
+    L.push(`Round numbers are not contiguous (gaps: ${gaps.join(', ')}). The extension was likely reloaded mid-session. For a complete transcript, scroll to the top of the chat, run "Log Entire Session", and regenerate this handoff.`);
+    L.push('');
+  }
+
+  L.push('## Priority reading');
+  L.push('');
+  if (flagged.length === 0) {
+    L.push('No rounds flagged (no self-corrections, no hedging spikes). Read the prompt log below; pull round files as needed.');
+  } else {
+    L.push('Rounds where drift indicators fired — these usually contain decisions, reversals, and dead ends:');
+    L.push('');
+    for (const f of flagged) {
+      const reasons = [];
+      if (f.self_correction) reasons.push('self-correction');
+      if (f.hedging_spike) reasons.push(`hedging spike (≥${HEDGING_FLAG_THRESHOLD})`);
+      L.push(`- **Round ${f.round}** — ${reasons.join(', ')}`);
+    }
+  }
+  L.push('');
+
+  L.push('## Chronological prompt log (decision proxy)');
+  L.push('');
+  L.push('User prompts are where directives and course-corrections enter a session. Full text lives in each round file.');
+  L.push('');
+  for (const r of rounds) L.push(`- **r${r.round}:** ${excerpt(r.prompt)}`);
+  L.push('');
+
+  const blocks = extractCodeBlocks(last.response).slice(0, MAX_CODE_BLOCKS_IN_STATE);
+  L.push(`## Latest code artifacts (as of round ${last.round})`);
+  L.push('');
+  if (blocks.length === 0) {
+    L.push('No fenced code blocks in the latest response.');
+  } else {
+    L.push(`Excerpts below; full versions live in the round-${last.round} files.`);
+    L.push('');
+    blocks.forEach((b, i) => {
+      L.push(`### Block ${i + 1} — \`${b.language}\` (${b.content.length} chars)`);
+      L.push('');
+      L.push('```' + b.language);
+      L.push(b.content.length > CODE_BLOCK_EXCERPT_CHARS
+        ? b.content.slice(0, CODE_BLOCK_EXCERPT_CHARS) + '\n// …truncated — see round file'
+        : b.content);
+      L.push('```');
+      L.push('');
+    });
+  }
+
+  L.push('## Media / artifact manifest');
+  L.push('');
+  let mediaCount = 0;
+  for (const r of rounds) {
+    for (const m of (r.media || [])) {
+      L.push(`- r${r.round}: \`${m.filename}\` → \`${m.dir}/\``);
+      mediaCount++;
+    }
+  }
+  if (mediaCount === 0) L.push('_No media logged this session._');
+  L.push('');
+
+  L.push('## Open threads (heuristic)');
+  L.push('');
+  const q = trailingQuestion(last.response);
+  if (q) {
+    L.push(`The round-${last.round} response ends with a question, possibly unanswered:`);
+    L.push('');
+    L.push(`> ${q}`);
+  } else {
+    L.push('No trailing question detected in the final response.');
+  }
+  L.push('');
+
+  L.push('## Round file index');
+  L.push('');
+  for (const r of rounds) {
+    L.push(`- **r${r.round}** (${r.timestamp_utc}) — \`${r.files.md}\``);
+  }
+
+  return L.join('\n');
+}
+
+// ─── Existing round serialization ───
 
 function createMarkdown(payload, sessionId, roundNum) {
   let md = `# AI Forensic Log\n\n`;
@@ -666,11 +975,12 @@ cat  >> "manifest.json" << 'EOF_ARCHIVE_CHUNK'
 {
   "manifest_version": 3,
   "name": "LLM Forensic Logger",
-  "version": "1.26",
+  "version": "1.27",
   "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
   "permissions": [
     "downloads",
     "storage",
+    "unlimitedStorage",
     "activeTab",
     "scripting"
   ],
@@ -779,6 +1089,8 @@ cat  >> "popup.html" << 'EOF_ARCHIVE_CHUNK'
 <body>
   <button id="bulkLog">Log Entire Session</button>
   <p class="warning">Note: For long chats, scroll to the very top of the conversation before clicking this to ensure all rounds are captured.</p>
+  <button id="handoff">Generate Handoff Document</button>
+  <p class="warning">Assembles a handoff from the recorded rounds. If none are recorded, run "Log Entire Session" first — the bulk log rebuilds the packet.</p>
   <p id="status" style="font-size: 12px; color: green;"></p>
   <script src="popup.js"></script>
 </body>
@@ -788,17 +1100,43 @@ echo 'Extracting: popup.js'
 mkdir -p "$(dirname "popup.js")"
 rm -f "popup.js"
 cat  >> "popup.js" << 'EOF_ARCHIVE_CHUNK'
+function setStatus(text, color) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.style.color = color;
+}
+
 document.getElementById('bulkLog').addEventListener('click', () => {
   chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
     chrome.tabs.sendMessage(tabs[0].id, { type: 'BULK_LOG_REQUEST' }, (response) => {
       if (chrome.runtime.lastError) {
-        document.getElementById('status').textContent = "Error: Please refresh the page!";
-        document.getElementById('status').style.color = 'red';
+        setStatus("Error: Please refresh the page!", 'red');
       } else {
-        document.getElementById('status').textContent = "Extracting... Check downloads.";
-        document.getElementById('status').style.color = 'green';
+        setStatus("Extracting... Check downloads.", 'green');
       }
       setTimeout(() => window.close(), 3000);
+    });
+  });
+});
+
+document.getElementById('handoff').addEventListener('click', () => {
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    let chatId = 'unknown';
+    try { chatId = new URL(tabs[0].url).pathname.split('/').pop() || 'unknown'; } catch (e) {}
+
+    chrome.runtime.sendMessage({ type: 'GENERATE_HANDOFF', chatId: chatId }, (response) => {
+      if (chrome.runtime.lastError || !response) {
+        setStatus("Error: background unreachable. Reload the extension.", 'red');
+        return;
+      }
+      if (response.status === 'success') {
+        setStatus(`Handoff written from ${response.rounds} rounds. Check downloads.`, 'green');
+        setTimeout(() => window.close(), 4000);
+      } else if (response.status === 'empty') {
+        setStatus(response.message, '#b45309');
+      } else {
+        setStatus('Error: ' + (response.error || 'unknown'), 'red');
+      }
     });
   });
 });
@@ -1180,411 +1518,227 @@ cat  >> "modules/google-search-ai-logger.js" << 'EOF_ARCHIVE_CHUNK'
 
 /**
  * google-search-ai-logger.js
+ * 
+ * Module for the LLM-Forensic-Logger extension.
+ * Specifically targets Google Search "AI Mode History" sessions.
+ * 
+ * Structural Anchors discovered:
+ *   Container: id="aim-chrome-initial-inline-async-container"
+ *   Turn:      data-scope-id="turn"
  */
 
-(() => {
-  'use strict';
+const MODULE_NAME = 'google-search-ai';
 
-  const MODULE_NAME = 'google-search-ai';
-  const BUTTON_LABEL = 'Log Entire Session';
-  const BUTTON_ID = 'forensic-log-session-btn';
+// ─── Structural Anchors ───
+const CHAT_CONTAINER_ID = 'aim-chrome-initial-inline-async-container';
+const TURN_SELECTOR = '[data-scope-id="turn"]';
 
-  const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'svg', 'path', 'img', 'br', 'hr', 'input', 'button']);
+// ─── 1. Container & Turn Detection ───
 
-  // ─── Page Detection (content-based, not just URL) ───
+function getAiChatContainer() {
+  return document.querySelector(`#${CHAT_CONTAINER_ID}`);
+}
 
-  function shouldActivate() {
-    // Method 1: URL parameter (fast, works for live AI Mode)
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('udm') === '50' || params.get('udm') === '14') return 'url_param';
+function extractAiTurns(container) {
+  if (!container) return [];
+  
+  const turns = Array.from(container.querySelectorAll(TURN_SELECTOR));
+  console.log(`[${MODULE_NAME}] Found ${turns.length} AI Turns in history container.`);
+  
+  return turns;
+}
 
-    // Method 2: Actual content on the page
-    // (works for saved sessions that might have different URLs)
-    const section = document.querySelector('section');
-    if (!section) return false;
+// ─── 2. Smart DOM Cleaning & Text Extraction ───
+// This replaces the brute-force innerText grab that resulted in 58K+ char bloat.
+// It walks the tree, ignores UI chrome (buttons, svgs, hidden elements), 
+// and captures only visible prose and citation links.
 
-    // Count external citation links — only AI responses have these
-    const links = section.querySelectorAll('a[href]');
-    let extCount = 0;
-    for (const link of links) {
-      const href = link.getAttribute('href') || '';
-      if (href.startsWith('http') && !href.includes('google.com')) extCount++;
-      if (href.startsWith('/url?')) extCount++;
-    }
+function cleanTurnElement(turnEl) {
+  const proseParts = [];
+  const citations = [];
 
-    if (extCount >= 3) return 'content_detected';
-    return false;
-  }
-
-  function parseUrl() {
-    const params = new URLSearchParams(window.location.search);
-    return {
-      query: params.get('q') || '',
-      searchId: params.get('ei') || '',
-      udm: params.get('udm') || '',
-    };
-  }
-
-  // ─── Find the actual AI response area ───
-
-  // ─── AI Chat Thread Detection ───
-
-  // From DOM diagnostic:
-  //   Section: 141K (whole page)
-  //   Main content: 141K, 12 children (search results + chat + sidebar)
-  //   Chat thread: 87K, 4 children (just the AI conversation)
-  //   Search results: 11 smaller containers totaling ~54K
-  //
-  // Strategy: find the div within the section that's in the 50K-100K
-  // range with 2-10 children. That's uniquely the chat thread.
-
-  function findAiChatThread() {
-    const section = document.querySelector('section');
-    if (!section) {
-      for (const c of [document.querySelector('#search'), document.querySelector('#rso'), document.querySelector('main')]) {
-        if (c && c.children.length > 0) return c;
+  // Recursive function to walk the DOM node by node
+  function walkNode(node) {
+    // Skip entire subtrees if they are UI noise
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const tag = node.tagName.toLowerCase();
+      
+      // Ignore buttons, SVGs, scripts, styles, and hidden accessibility spans
+      if (tag === 'button' || tag === 'svg' || tag === 'script' || tag === 'style') return;
+      if (node.getAttribute('aria-hidden') === 'true') return;
+      
+      // If it's a citation link, grab the URL and text, then stop descending
+      if (tag === 'a' && node.href) {
+        const linkText = (node.textContent || '').trim();
+        if (linkText.length > 0 && linkText.length < 100) { // Filter out weird long text links
+          proseParts.push(linkText);
+          citations.push({
+            text: linkText,
+            url: node.href
+          });
+        }
+        return; // Don't descend into links further to avoid duplicate text
       }
-      return null;
     }
 
-    let chatThread = null;
-    let bestLen = 0;
-
-    section.querySelectorAll('div').forEach(el => {
-      const t = (el.textContent || '').trim().length;
-      const c = el.children.length;
-
-      // Chat thread: large text (50K-100K) but not whole page (<120K)
-      // Few children (2-10) — not 12+ like the results container
-      if (t >= 50000 && t < 120000 && c >= 2 && c <= 10) {
-        if (t > bestLen) {
-          bestLen = t;
-          chatThread = el;
+    // If it's a text node, grab the visible text
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent.trim();
+      if (text.length > 0) {
+        // Filter out known Google UI noise strings
+        if (text !== 'CopiedCopyEdit' && text !== 'Copy' && text !== 'Edit') {
+          proseParts.push(text);
         }
       }
-    });
-
-    if (chatThread) {
-      console.log(`[${MODULE_NAME}] Found AI chat thread: <${chatThread.tagName}> textLen=${bestLen} children=${chatThread.children.length}`);
-      // Show what the 4 children look like (the chat turns)
-      for (let i = 0; i < Math.min(chatThread.children.length, 8); i++) {
-        const child = chatThread.children[i];
-        const len = (child.textContent || '').trim().length;
-        console.log(`[${MODULE_NAME}]   Turn [${i}]: <${child.tagName}> class="${(child.className||'').substring(0,40)}" textLen=${len} preview="${(child.textContent||'').trim().substring(0,60)}"`);
-      }
-      return chatThread;
-    }
-
-    console.log(`[${MODULE_NAME}] No chat thread found, using section`);
-    return section;
-  }
-
-  function commonAncestor(a, b) {
-    const set = new Set();
-    let n = a;
-    while (n) { set.add(n); n = n.parentElement; }
-    n = b;
-    while (n) { if (set.has(n)) return n; n = n.parentElement; }
-    return null;
-  }
-
-  // ─── Text Extraction ───
-
-  function getCleanText(element) {
-    let result = '';
-    let nodeCount = 0;
-
-    function walk(el) {
-      if (nodeCount > 50000) return;
-      if (SKIP_TAGS.has(el.tagName?.toLowerCase())) return;
-
-      const role = el.getAttribute('role');
-      if (role && /^(navigation|complementary|search|banner|toolbar|tablist)$/.test(role)) return;
-      if (el.getAttribute('aria-hidden') === 'true') return;
-      const ariaLabel = el.getAttribute('aria-label') || '';
-      if (/history|sidebar|close|menu|manage/i.test(ariaLabel)) return;
-
-      for (const child of el.childNodes) {
-        nodeCount++;
-        if (child.nodeType === 3) {
-          const t = child.textContent;
-          if (t && t.trim()) result += t;
-        } else if (child.nodeType === 1) {
-          walk(child);
-        }
-      }
-    }
-
-    walk(element);
-    return result.replace(/\s{2,}/g, ' ').trim();
-  }
-
-  // ─── Citations ───
-
-  function extractCitationsFrom(container) {
-    const citations = [];
-    const seenUrls = new Set();
-    const links = container.querySelectorAll('a[href]');
-    for (const link of links) {
-      const href = link.getAttribute('href') || '';
-      const url = unwrapUrl(href);
-      if (!url || url.includes('google.com')) continue;
-      if (!seenUrls.has(url)) {
-        seenUrls.add(url);
-        citations.push({ title: (link.textContent || '').trim().substring(0, 80), url: url });
-      }
-    }
-    return citations;
-  }
-
-  function unwrapUrl(href) {
-    if (href.startsWith('/url?') || href.startsWith('/aclk')) {
-      try {
-        const params = new URLSearchParams(href.substring(href.indexOf('?')));
-        return decodeURIComponent(params.get('q') || params.get('url') || href);
-      } catch { return href; }
-    }
-    if (href.startsWith('http')) return href;
-    return '';
-  }
-
-  // ─── Save with fallback ───
-
-  function saveData(key, data) {
-    try {
-      if (chrome?.runtime?.id) {
-        chrome.storage.local.set({ [key]: data }).catch(() => {});
-        chrome.runtime.sendMessage({ type: 'forensic_log_entry', entry: data }).catch(() => {});
-        return 'extension';
-      }
-    } catch {}
-    try {
-      localStorage.setItem(key, JSON.stringify(data));
-      return 'localStorage';
-    } catch (e) {
-      return 'failed';
-    }
-  }
-
-  // ─── Noise Removal (applied after extraction) ───
-
-  function cleanExtractedText(rawText) {
-    // The sidebar content appears verbatim multiple times.
-    // Real AI content is unique. Strategy: split into segments,
-    // drop duplicates and known UI labels.
-
-    if (rawText.length < 5000) return rawText; // short text is probably clean
-
-    // Split into sentence-level segments
-    const segments = rawText.match(/[^.!?]+[.!?]+/g) || [];
-    if (segments.length === 0) return rawText; // couldn't split, return raw
-
-    const seen = {};
-    const kept = [];
-
-    for (const seg of segments) {
-      const key = seg.trim();
-      if (key.length < 10) {
-        // Skip tiny fragments unless they look like content
-        if (/^\d+$/.test(key) || /^[,;:-]$/.test(key)) continue;
-        kept.push(key);
-        continue;
-      }
-      if (!seen[key]) {
-        seen[key] = 1;
-        kept.push(key);
-      }
-      // Duplicates are dropped (UI chrome repeats, content doesn't)
-    }
-
-    // Remove known UI label strings
-    const uiLabels = [
-      'AI Mode history', 'New thread', 'Close sidebar',
-      'Search threads', 'Manage public links', 'See my AI Mode history',
-      'Copy', 'Share', 'Feedback', 'Expand', 'Collapse',
-      'Open sidebar', 'Close', 'More', 'Report',
-    ];
-
-    const filtered = kept.filter(seg => {
-      const trimmed = seg.trim();
-      return !uiLabels.some(label => trimmed === label || trimmed.startsWith(label + ' '));
-    });
-
-    let cleaned = filtered.join(' ').replace(/\s{2,}/g, ' ').trim();
-
-    // Final pass: remove any remaining long runs of short label-like fragments
-    // (e.g. "New thread Close sidebar Search threads Manage public links")
-    cleaned = cleaned.replace(
-      /(New thread|Close sidebar|Search threads|Manage public links|AI Mode history|See my AI Mode history|Copy|Share|Feedback)[\s]+/gi,
-      ''
-    ).replace(/\s{2,}/g, ' ').trim();
-
-    return cleaned;
-  }
-
-  // ─── Extraction ───
-
-  function extractSession() {
-    console.log(`[${MODULE_NAME}] === EXTRACTION START ===`);
-    const urlData = parseUrl();
-
-    const responseArea = findAiChatThread();
-    if (!responseArea) {
-      console.log(`[${MODULE_NAME}] No response area found`);
-      return null;
-    }
-
-    // Compare section full text vs response area text
-    const section = document.querySelector('section');
-    const sectionLen = section ? getCleanText(section).length : 0;
-
-
-    let rawText = responseArea ? getCleanText(responseArea) : '';
-    console.log(`[${MODULE_NAME}] Response area raw text: ${rawText.length} chars`);
-
-    console.log(`[${MODULE_NAME}] Cleaning UI noise...`);
-    let responseText = cleanExtractedText(rawText);
-    console.log(`[${MODULE_NAME}] Cleaned text: ${responseText.length} chars (removed ${rawText.length - responseText.length})`);
-
-
-    let aiText = getCleanText(responseArea);
-    if (urlData.query && aiText.startsWith(urlData.query)) {
-      aiText = aiText.substring(urlData.query.length).trim();
-    }
-
-    const citations = extractCitationsFrom(responseArea);
-    console.log(`[${MODULE_NAME}] Citations: ${citations.length}`);
-    console.log(`[${MODULE_NAME}] Preview:`, aiText.substring(0, 300));
-
-    const messages = [];
-    if (urlData.query) messages.push({ role: 'user', content: urlData.query, citations: [] });
-    if (aiText) messages.push({ role: 'ai', content: aiText, citations: citations });
-
-    return {
-      module: MODULE_NAME,
-      event_type: 'session_log',
-      timestamp: Date.now(),
-      search_id: urlData.searchId,
-      url: window.location.href,
-      query: urlData.query,
-      udm: urlData.udm,
-      conversation: messages,
-      sources: citations,
-    };
-  }
-
-  // ─── Button ───
-
-  function injectButton() {
-    if (document.getElementById(BUTTON_ID)) return;
-
-    const btn = document.createElement('button');
-    btn.id = BUTTON_ID;
-    btn.textContent = BUTTON_LABEL;
-    btn.style.cssText = `
-      position: fixed; bottom: 20px; right: 20px;
-      padding: 10px 18px; background: #1a73e8; color: white;
-      border: none; border-radius: 8px; font-size: 14px;
-      font-weight: 600; cursor: pointer; z-index: 999999;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-    `;
-    btn.addEventListener('mouseenter', () => btn.style.background = '#1557b0');
-    btn.addEventListener('mouseleave', () => btn.style.background = '#1a73e8');
-    btn.addEventListener('click', handleLogClick);
-
-    document.body.appendChild(btn);
-    console.log(`[${MODULE_NAME}] Button injected`);
-  }
-
-  function handleLogClick() {
-    const btn = document.getElementById(BUTTON_ID);
-    btn.textContent = 'Capturing...';
-    btn.disabled = true;
-    btn.style.opacity = '0.7';
-
-    try {
-      const sessionData = extractSession();
-
-      if (!sessionData || sessionData.conversation.length === 0) {
-        throw new Error('No AI conversation content found on this page');
-      }
-
-      const aiMsg = sessionData.conversation.find(m => m.role === 'ai');
-      const charCount = aiMsg?.content?.length || 0;
-
-      const key = `search_ai_${sessionData.search_id || 'unknown'}_${sessionData.timestamp}`;
-      const where = saveData(key, sessionData);
-
-      if (where === 'extension') {
-        btn.textContent = `Logged ✓ ${charCount} chars, ${sessionData.sources.length} sources`;
-        btn.style.background = '#34a853';
-      } else if (where === 'localStorage') {
-        btn.textContent = `Saved (localStorage) ✓ ${charCount} chars`;
-        btn.style.background = '#f9a825';
-      } else {
-        btn.textContent = `Captured ${charCount} chars — save failed`;
-        btn.style.background = '#ea4335';
-      }
-
-    } catch (err) {
-      btn.textContent = `Error: ${err.message}`;
-      btn.style.background = '#ea4335';
-      console.log(`[${MODULE_NAME}] FAILED:`, err);
-    }
-
-    setTimeout(() => {
-      btn.textContent = BUTTON_LABEL;
-      btn.disabled = false;
-      btn.style.opacity = '1';
-      btn.style.background = '#1a73e8';
-    }, 5000);
-  }
-
-  // ─── Init ───
-
-  // ─── Init ───
-
-  function init() {
-    console.log(`[${MODULE_NAME}] init() called. URL: ${window.location.href.substring(0, 80)}`);
-
-    const reason = shouldActivate();
-    if (!reason) {
-      console.log(`[${MODULE_NAME}] No AI content detected, skipping`);
       return;
     }
 
-    console.log(`[${MODULE_NAME}] AI content detected (${reason})`);
-    injectButton();
+    // Recurse into children
+    for (const child of node.childNodes) {
+      walkNode(child);
+    }
   }
 
-  // Initial run after page settles
-  if (document.readyState === 'complete') {
-    setTimeout(init, 3000);
-  } else {
-    window.addEventListener('load', () => setTimeout(init, 3000));
+  walkNode(turnEl);
+
+  // Join the prose parts with spaces, cleaning up weird spacing
+  const cleanedText = proseParts.join(' ')
+    .replace(/\s+/g, ' ') // Collapse multiple spaces
+    .trim();
+
+  return {
+    rawLength: (turnEl.textContent || '').trim().length,
+    cleanedLength: cleanedText.length,
+    text: cleanedText,
+    citations: citations
+  };
+}
+
+// ─── 3. Processing & Formatting the Conversation ───
+
+function processConversation(turns) {
+  const conversationLog = [];
+
+  turns.forEach((turnEl, index) => {
+    const cleanedData = cleanTurnElement(turnEl);
+    
+    console.log(`[${MODULE_NAME}]   Turn [${index}]: rawLen=${cleanedData.rawLength} -> cleanedLen=${cleanedData.cleanedLength} citations=${cleanedData.citations.length}`);
+    console.log(`[${MODULE_NAME}]   Turn [${index}] Preview: "${cleanedData.text.substring(0, 120)}..."`);
+
+    conversationLog.push({
+      turnIndex: index,
+      text: cleanedData.text,
+      citations: cleanedData.citations
+      // Note: In a real forensic logger, you might want to detect if this turn 
+      // is a "User Prompt" or an "AI Response" based on sub-elements inside the turn.
+      // For now, we are just extracting the clean text linearly.
+    });
+  });
+
+  return conversationLog;
+}
+
+  // ─── 4. MutationObserver (SPA-Proof) ───
+  // Instead of observing the fragile container, we observe the whole body
+  // and specifically listen for the injection of 'turn' elements.
+
+  function observeForAiTurns() {
+    console.log(`[${MODULE_NAME}] Attaching global SPA Observer to document.body...`);
+
+    const observer = new MutationObserver((mutationsList) => {
+      for (const mutation of mutationsList) {
+        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              
+              // Check if the added node IS a turn, or CONTAINS a turn
+              const isTurn = node.matches(TURN_SELECTOR);
+              const containsTurns = node.querySelector(TURN_SELECTOR);
+
+              if (isTurn || containsTurns) {
+                console.log(`[${MODULE_NAME}] SPA Observer detected AI Turns injected!`);
+                
+                // Disconnect observer temporarily to avoid infinite loops during extraction
+                observer.disconnect();
+
+                // Wait a brief moment for Google's slow UI to finish rendering text
+                setTimeout(() => {
+                  processCurrentHistoryView();
+                  // Re-observe after processing so we catch the NEXT history click
+                  observeForAiTurns();
+                }, 500); 
+
+                return; // Exit the loop, we found our target
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Observe the whole body, subtree true, so we catch injections anywhere on the page
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  // ─── Persistent re-injection ───
-  // Google's SPA rebuilds the DOM, destroying injected elements.
-  // Periodically check and re-inject if the button disappeared.
+  // ─── 5. Processing & Formatting the Conversation ───
 
-  setInterval(() => {
-    if (shouldActivate() && !document.getElementById(BUTTON_ID)) {
-      console.log(`[${MODULE_NAME}] Button lost from DOM, re-injecting`);
-      injectButton();
+  function processCurrentHistoryView() {
+    // Re-query the container and turns fresh (they might be new DOM nodes now)
+    const container = getAiChatContainer();
+    if (!container) {
+      console.log(`[${MODULE_NAME}] Container vanished before processing could begin.`);
+      return;
     }
-  }, 5000);
 
-  // MutationObserver for late-rendering content — do NOT disconnect
-  let observerRetry = 0;
-  new MutationObserver(() => {
-    if (!document.getElementById(BUTTON_ID) && observerRetry < 30 && shouldActivate()) {
-      observerRetry++;
-      setTimeout(init, 2000);
+    const turns = extractAiTurns(container);
+    if (turns.length === 0) {
+      console.log(`[${MODULE_NAME}] Turns detected, but extraction found 0 elements. DOM might still be loading.`);
+      return;
     }
-  }).observe(document.body, { childList: true, subtree: true });
 
-})();
+    const conversationLog = [];
+
+    turns.forEach((turnEl, index) => {
+      const cleanedData = cleanTurnElement(turnEl);
+      
+      console.log(`[${MODULE_NAME}]   Turn [${index}]: rawLen=${cleanedData.rawLength} -> cleanedLen=${cleanedData.cleanedLength} citations=${cleanedData.citations.length}`);
+      console.log(`[${MODULE_NAME}]   Turn [${index}] Preview: "${cleanedData.text.substring(0, 120)}..."`);
+
+      conversationLog.push({
+        turnIndex: index,
+        text: cleanedData.text,
+        citations: cleanedData.citations
+      });
+    });
+
+    console.log(`[${MODULE_NAME}] Forensic Log Complete. Turns processed: ${conversationLog.length}`);
+    console.log(`[${MODULE_NAME}] Final Log Object:`, conversationLog);
+    
+    // ────── LOG TO EXTENSION STORAGE HERE ──────
+    // chrome.storage.local.set({ googleAiHistory: conversationLog });
+  }
+
+  // ─── 6. Initialization ───
+
+  function init() {
+    console.log(`[${MODULE_NAME}] Initializing Forensic Logger...`);
+    
+    // 1. Check if a history conversation is already fully rendered on the page 
+    // (e.g., if the user refreshed the page while looking at one)
+    const existingTurns = document.querySelectorAll(TURN_SELECTOR);
+    if (existingTurns.length > 0) {
+      console.log(`[${MODULE_NAME}] Found ${existingTurns.length} existing Turns on page load. Processing immediately.`);
+      processCurrentHistoryView();
+      // We still start the observer so we catch it if they click a different history item
+      observeForAiTurns();
+    } else {
+      // 2. If no turns exist yet, start the observer to wait for the user to click one
+      observeForAiTurns();
+    }
+  }
+
+  // Run initialization
+  init();
 EOF_ARCHIVE_CHUNK
 echo 'Extracting: modules/index.js'
 mkdir -p "$(dirname "modules/index.js")"

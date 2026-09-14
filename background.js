@@ -1,5 +1,14 @@
 console.log("[Forensic Logger] New background.js loaded successfully.");
 
+// ─── Configuration ───
+const EMIT_ROLLING_STATE = true;    // write a state snapshot JSON after every round
+const HEDGING_FLAG_THRESHOLD = 3;   // hedging_language_count >= this flags a round for priority review
+const MAX_STORED_ROUNDS = 500;      // safety valve for the in-extension transcript packet
+const MAX_CODE_BLOCKS_IN_STATE = 8;
+const CODE_BLOCK_EXCERPT_CHARS = 1600;
+const PROMPT_EXCERPT_CHARS = 200;
+const HANDOFF_SCHEMA_VERSION = 1;
+
 let isProcessing = false;
 const logQueue = [];
 
@@ -11,30 +20,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.type === 'BULK_LOG_SESSION') {
     const { rounds, sessionName, chatId } = message.payload;
     console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
-    
-    // ADD THIS: Reset the sequence number for this chat to 0 before queueing
+
     if (chatId) {
-      getSessionState(chatId, true).then(() => {
-        rounds.forEach((roundData) => {
-          const payload = {
-            prompt: roundData.prompt,
-            thinking: roundData.thinking || "",
-            response: roundData.response,
-            mediaFiles: roundData.mediaFiles || [],
-            roundHtml: roundData.roundHtml || "",
-            sessionName: sessionName || "Untitled Session",
-            metadata: roundData.metadata || {},
-            chatId: chatId, // Pass chatId in payload
-            generationDurationMs: 0,
-            domNodeCount: 0,
-            origin: sender.tab ? sender.tab.url : 'unknown'
-          };
-          logQueue.push({ payload, isBulk: true });
+      // Reset the packet first, so the bulk replay rebuilds it cleanly
+      resetSessionPacket(chatId)
+        .then(() => getSessionState(chatId, true))
+        .then(() => {
+          rounds.forEach((roundData) => {
+            const payload = {
+              prompt: roundData.prompt,
+              thinking: roundData.thinking || "",
+              response: roundData.response,
+              mediaFiles: roundData.mediaFiles || [],
+              roundHtml: roundData.roundHtml || "",
+              sessionName: sessionName || "Untitled Session",
+              metadata: roundData.metadata || {},
+              chatId: chatId,
+              generationDurationMs: 0,
+              domNodeCount: 0,
+              origin: sender.tab ? sender.tab.url : 'unknown'
+            };
+            logQueue.push({ payload, isBulk: true });
+          });
+          processQueue();
         });
-        processQueue();
-      });
     }
     sendResponse({ status: 'success' });
+  } else if (message.type === 'GENERATE_HANDOFF') {
+    generateHandoff(message.chatId)
+      .then(res => sendResponse(res))
+      .catch(e => sendResponse({ status: 'error', error: e.message }));
   }
   return true;
 });
@@ -54,13 +69,12 @@ async function processQueue() {
 async function getSessionState(chatId, shouldReset = false) {
   const data = await chrome.storage.local.get(['sessions']);
   const sessions = data.sessions || {};
-  
+
   if (!sessions[chatId] || shouldReset) {
-    // Generate a NEW Session ID and reset the round number to 0
     sessions[chatId] = { SESSION_ID: crypto.randomUUID(), round_number: 0 };
     await chrome.storage.local.set({ sessions });
   }
-  
+
   return sessions[chatId];
 }
 
@@ -69,6 +83,45 @@ async function saveSessionState(chatId, state) {
   const sessions = data.sessions || {};
   sessions[chatId] = state;
   await chrome.storage.local.set({ sessions });
+}
+
+// ─── Session Packet (normalized transcript retained for state/handoff engine) ───
+// The authoritative transcript remains the downloaded round files. This packet
+// is a working copy so the handoff can be assembled without re-reading the DOM.
+
+async function resetSessionPacket(chatId) {
+  const data = await chrome.storage.local.get(['sessionPackets']);
+  const packets = data.sessionPackets || {};
+  packets[chatId] = { session_id: null, session_name: null, rounds: [] };
+  await chrome.storage.local.set({ sessionPackets: packets });
+}
+
+async function appendToPacket(chatId, entry) {
+  const data = await chrome.storage.local.get(['sessionPackets']);
+  const packets = data.sessionPackets || {};
+  if (!packets[chatId]) {
+    packets[chatId] = { session_id: null, session_name: null, rounds: [] };
+  }
+  const packet = packets[chatId];
+  if (entry.session_id && !packet.session_id) packet.session_id = entry.session_id;
+  if (entry.session_name) packet.session_name = entry.session_name;
+
+  // Dedupe consecutive identical rounds (live logging can double-fire)
+  const last = packet.rounds[packet.rounds.length - 1];
+  if (!(last && last.prompt === entry.prompt && last.response === entry.response)) {
+    packet.rounds.push(entry);
+  }
+
+  if (packet.rounds.length > MAX_STORED_ROUNDS) {
+    packet.rounds = packet.rounds.slice(-MAX_STORED_ROUNDS);
+  }
+  await chrome.storage.local.set({ sessionPackets: packets });
+  return packet;
+}
+
+async function getPacket(chatId) {
+  const data = await chrome.storage.local.get(['sessionPackets']);
+  return (data.sessionPackets || {})[chatId] || null;
 }
 
 async function logRound(payload, chatId) {
@@ -119,7 +172,264 @@ async function logRound(payload, chatId) {
       }, idx * 200);
     });
   }
+
+  // ── Retain normalized copy + emit rolling state snapshot ──
+  const packetEntry = {
+    round: roundNum,
+    timestamp_utc: jsonContent.timestamp_logged_utc,
+    session_id: state.SESSION_ID,
+    session_name: payload.sessionName || null,
+    prompt: payload.prompt || "",
+    thinking: payload.thinking || "",
+    response: payload.response || "",
+    metrics: jsonContent.metrics,
+    media: (payload.mediaFiles || []).map(m => ({ filename: m.filename, dir: mediaDirName })),
+    files: {
+      md: `${folderPath}${baseFilename}.md`,
+      json: `${folderPath}${baseFilename}.json`,
+      xhtml: `${folderPath}${baseFilename}.xhtml`,
+      media_dir: (payload.mediaFiles && payload.mediaFiles.length > 0) ? `${folderPath}${mediaDirName}` : null
+    }
+  };
+  const packet = await appendToPacket(chatId, packetEntry);
+
+  if (EMIT_ROLLING_STATE) {
+    const stateJson = buildRollingStateJson(state, packet, payload, chatId, HOSTNAME);
+    const stateUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(stateJson, null, 2));
+    const stateFilename = `${folderPath}state.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}.json`;
+    chrome.downloads.download({ url: stateUrl, filename: stateFilename, saveAs: false });
+  }
 }
+
+// ─── Mechanical extraction helpers (no interpretation, regex/counters only) ───
+
+function extractCodeBlocks(md) {
+  const out = [];
+  if (!md) return out;
+  const re = /```([A-Za-z0-9_+#.-]*)[^\S\n]*\n([\s\S]*?)(?:```|$)/g;
+  let m;
+  while ((m = re.exec(md)) !== null) {
+    if (m[2].trim().length === 0) continue;
+    out.push({ language: m[1] || 'text', content: m[2].replace(/\n$/, '') });
+  }
+  return out;
+}
+
+function trailingQuestion(text) {
+  if (!text) return null;
+  const tail = text.trim().slice(-400);
+  const m = tail.match(/([^\n]*\?)\s*$/);
+  return m ? m[1].trim().slice(0, 300) : null;
+}
+
+function computeFlags(metrics) {
+  const d = (metrics && metrics.drift_and_hallucination_indicators) || {};
+  return {
+    self_correction: (d.self_correction_count || 0) > 0,
+    hedging_spike: (d.hedging_language_count || 0) >= HEDGING_FLAG_THRESHOLD
+  };
+}
+
+function excerpt(s, n = PROMPT_EXCERPT_CHARS) {
+  if (!s) return '';
+  const t = s.replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n) + '…' : t;
+}
+
+function buildRollingStateJson(sessionState, packet, payload, chatId, HOSTNAME) {
+  const rounds = packet.rounds;
+  const last = rounds[rounds.length - 1] || null;
+  const codeBlocks = last ? extractCodeBlocks(last.response).slice(0, MAX_CODE_BLOCKS_IN_STATE) : [];
+
+  return {
+    type: 'rolling_state',
+    schema_version: HANDOFF_SCHEMA_VERSION,
+    session_id: sessionState.SESSION_ID,
+    chat_id: chatId,
+    session_name: payload.sessionName || packet.session_name || null,
+    hostname: HOSTNAME,
+    generated_at_utc: new Date().toISOString(),
+    rounds_recorded: rounds.length,
+    highest_round: sessionState.round_number,
+    objective: {
+      session_name: payload.sessionName || packet.session_name || null,
+      first_prompt_excerpt: rounds.length ? excerpt(rounds[0].prompt, 400) : ''
+    },
+    prompt_index: rounds.map(r => ({ round: r.round, excerpt: excerpt(r.prompt) })),
+    latest_code_blocks: codeBlocks.map(b => ({
+      language: b.language,
+      char_count: b.content.length,
+      source_round: last.round,
+      excerpt: b.content.slice(0, CODE_BLOCK_EXCERPT_CHARS),
+      truncated: b.content.length > CODE_BLOCK_EXCERPT_CHARS
+    })),
+    media_manifest: rounds.flatMap(r => (r.media || []).map(m => ({ round: r.round, filename: m.filename, dir: m.dir }))),
+    flagged_rounds: rounds
+      .map(r => ({ round: r.round, ...computeFlags(r.metrics) }))
+      .filter(x => x.self_correction || x.hedging_spike),
+    question_pending_at_round_end: (last && trailingQuestion(last.response))
+      ? { round: last.round, text: trailingQuestion(last.response) }
+      : null,
+    latest_files: last ? last.files : null
+  };
+}
+
+// ─── On-demand handoff (assembly only — never summarization) ───
+
+async function generateHandoff(chatId) {
+  const packet = await getPacket(chatId);
+  if (!packet || packet.rounds.length === 0) {
+    return {
+      status: 'empty',
+      message: 'No recorded rounds for this chat in extension storage. Scroll to top and click "Log Entire Session" to rebuild the packet, then try again.'
+    };
+  }
+
+  const { hostname } = await chrome.storage.local.get(['hostname']);
+  const HOSTNAME = hostname || 'unknown-host';
+
+  const rounds = packet.rounds;
+  const last = rounds[rounds.length - 1];
+  const sessionId = packet.session_id || 'no-session-id';
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+  const seqNum = String(last.round).padStart(8, '0');
+  const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
+  const baseName = `handoff.${sessionId}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+
+  const md = buildHandoffMarkdown({
+    sessionId,
+    sessionName: packet.session_name,
+    chatId,
+    hostname: HOSTNAME,
+    packet
+  });
+
+  const url = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(md);
+  chrome.downloads.download({ url, filename: `${folderPath}${baseName}.md`, saveAs: false });
+
+  return { status: 'success', rounds: rounds.length };
+}
+
+function buildHandoffMarkdown({ sessionId, sessionName, chatId, hostname, packet }) {
+  const rounds = packet.rounds;
+  const last = rounds[rounds.length - 1];
+  const first = rounds[0];
+
+  const flagged = [];
+  for (const r of rounds) {
+    const f = computeFlags(r.metrics);
+    if (f.self_correction || f.hedging_spike) flagged.push({ round: r.round, ...f });
+  }
+
+  const gaps = [];
+  for (let i = 1; i < rounds.length; i++) {
+    if (rounds[i].round !== rounds[i - 1].round + 1) gaps.push(`${rounds[i - 1].round}→${rounds[i].round}`);
+  }
+
+  const L = [];
+  L.push(`# Session Handoff — ${sessionName || sessionId}`);
+  L.push('');
+  L.push(`**Session ID:** \`${sessionId}\`  ·  **Chat:** \`${chatId}\`  ·  **Host:** \`${hostname}\``);
+  L.push(`**Generated:** ${new Date().toISOString()}  ·  **Rounds recorded:** ${rounds.length} (highest round #${last.round})`);
+  L.push('');
+  L.push('> **HOW TO USE (receiving model):** This file was generated mechanically from a lossless transcript — no LLM summarized it.');
+  L.push('> 1. Read this file, then **restate your understanding and ask clarifying questions before doing any work**.');
+  L.push('> 2. This file is a map; the round files it points to are the territory. Pull them when detail matters.');
+  L.push('> 3. Flag apparent inconsistencies instead of silently resolving them.');
+  L.push('');
+
+  L.push('## Objective');
+  L.push('');
+  L.push(`**First prompt (excerpt):** ${excerpt(first.prompt, 400)}`);
+  L.push('');
+
+  if (gaps.length) {
+    L.push('## ⚠ Data gaps');
+    L.push('');
+    L.push(`Round numbers are not contiguous (gaps: ${gaps.join(', ')}). The extension was likely reloaded mid-session. For a complete transcript, scroll to the top of the chat, run "Log Entire Session", and regenerate this handoff.`);
+    L.push('');
+  }
+
+  L.push('## Priority reading');
+  L.push('');
+  if (flagged.length === 0) {
+    L.push('No rounds flagged (no self-corrections, no hedging spikes). Read the prompt log below; pull round files as needed.');
+  } else {
+    L.push('Rounds where drift indicators fired — these usually contain decisions, reversals, and dead ends:');
+    L.push('');
+    for (const f of flagged) {
+      const reasons = [];
+      if (f.self_correction) reasons.push('self-correction');
+      if (f.hedging_spike) reasons.push(`hedging spike (≥${HEDGING_FLAG_THRESHOLD})`);
+      L.push(`- **Round ${f.round}** — ${reasons.join(', ')}`);
+    }
+  }
+  L.push('');
+
+  L.push('## Chronological prompt log (decision proxy)');
+  L.push('');
+  L.push('User prompts are where directives and course-corrections enter a session. Full text lives in each round file.');
+  L.push('');
+  for (const r of rounds) L.push(`- **r${r.round}:** ${excerpt(r.prompt)}`);
+  L.push('');
+
+  const blocks = extractCodeBlocks(last.response).slice(0, MAX_CODE_BLOCKS_IN_STATE);
+  L.push(`## Latest code artifacts (as of round ${last.round})`);
+  L.push('');
+  if (blocks.length === 0) {
+    L.push('No fenced code blocks in the latest response.');
+  } else {
+    L.push(`Excerpts below; full versions live in the round-${last.round} files.`);
+    L.push('');
+    blocks.forEach((b, i) => {
+      L.push(`### Block ${i + 1} — \`${b.language}\` (${b.content.length} chars)`);
+      L.push('');
+      L.push('```' + b.language);
+      L.push(b.content.length > CODE_BLOCK_EXCERPT_CHARS
+        ? b.content.slice(0, CODE_BLOCK_EXCERPT_CHARS) + '\n// …truncated — see round file'
+        : b.content);
+      L.push('```');
+      L.push('');
+    });
+  }
+
+  L.push('## Media / artifact manifest');
+  L.push('');
+  let mediaCount = 0;
+  for (const r of rounds) {
+    for (const m of (r.media || [])) {
+      L.push(`- r${r.round}: \`${m.filename}\` → \`${m.dir}/\``);
+      mediaCount++;
+    }
+  }
+  if (mediaCount === 0) L.push('_No media logged this session._');
+  L.push('');
+
+  L.push('## Open threads (heuristic)');
+  L.push('');
+  const q = trailingQuestion(last.response);
+  if (q) {
+    L.push(`The round-${last.round} response ends with a question, possibly unanswered:`);
+    L.push('');
+    L.push(`> ${q}`);
+  } else {
+    L.push('No trailing question detected in the final response.');
+  }
+  L.push('');
+
+  L.push('## Round file index');
+  L.push('');
+  for (const r of rounds) {
+    L.push(`- **r${r.round}** (${r.timestamp_utc}) — \`${r.files.md}\``);
+  }
+
+  return L.join('\n');
+}
+
+// ─── Existing round serialization ───
 
 function createMarkdown(payload, sessionId, roundNum) {
   let md = `# AI Forensic Log\n\n`;

@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "LLM Forensic Logger",
-  "version": "1.26",
+  "version": "1.27",
   "description": "Logs LLM/AI chat rounds to local filesystem as MD and JSON.",
   "permissions": [
     "downloads",
     "storage",
+    "unlimitedStorage",
     "activeTab",
     "scripting"
   ],
