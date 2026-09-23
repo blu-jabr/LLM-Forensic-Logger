@@ -1,0 +1,14 @@
+
+Battery:
+
+grep -h '^ \[' flush.*.md | grep '(' | wc -l 
+grep -ho '"url_match_type": "[^"]*"' flush.*.json | sort | uniq -c
+grep ChipResolve debug.*.txt
+
+
+Two bookkeeping notes
+
+Document the contract: add a comment in gemini.js's header noting that content.js's chip resolver depends on the data-fl-cid/data-fl-skey stamps — that coupling is now part of the module interface, and it's exactly the kind of thing the next merge casualty would otherwise hide.
+.xhtml caveat for the record: the snapshots contain the p-rc_ ids and (now) the stamps, but when opened in a browser the same re-parenting occurs — the chip's visual ancestor may differ from the live DOM. The data attributes preserve the mapping regardless, which is the forensically important part.
+If step 4 delivers ~59 resolved links with stable-key provenance, the citation system is complete: N chips per span, N citations per chip, capture via left/middle-click and hover-cards, per-instance provenance, and persistence across re-renders and sessions. Then it's the citation index (keyed on stable_key, which now also gives you the "pending-capture" checklist so no future pass is blind), version 1.28, Directory_Structure.md, and the commit on seacouver.
+

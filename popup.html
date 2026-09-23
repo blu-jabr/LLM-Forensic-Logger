@@ -7,12 +7,18 @@
     .warning { font-size: 11px; color: #555; margin-top: 5px; }
   </style>
 </head>
+
 <body>
   <button id="bulkLog">Log Entire Session</button>
   <p class="warning">Note: For long chats, scroll to the very top of the conversation before clicking this to ensure all rounds are captured.</p>
+
   <button id="handoff">Generate Handoff Document</button>
   <p class="warning">Assembles a handoff from the recorded rounds. If none are recorded, run "Log Entire Session" first — the bulk log rebuilds the packet.</p>
-  <p id="status" style="font-size: 12px; color: green;"></p>
+
+  <button id="debugLog">Download Debug Log</button>
+  <p id="status" style="font-size:12px; color:green;"></p>
+
   <script src="popup.js"></script>
 </body>
+
 </html>

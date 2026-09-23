@@ -5,6 +5,28 @@
 (function() {
     const match = (host, path) => host.includes('gemini.google.com');
 
+    // Stamp each chip with its stable key + cid so content.js can resolve URLs
+    // from serialized HTML. The p-rc_ paragraph ids do not survive re-parse
+    // (block-in-<p> re-parenting), so the mapping must travel ON the chip.
+    const stampChips = (scope) => {
+        try {
+            const doc = scope.ownerDocument || scope;
+            scope.querySelectorAll('source-inline-chip, .source-inline-chip-container').forEach(chip => {
+                const holder = chip.closest('[id^="p-rc_"]');
+                if (!holder) return;
+                chip.setAttribute('data-fl-cid', holder.id);
+                const m = holder.id.match(/^p-rc_([0-9a-f]+)-(\d+)$/);
+                if (!m) return;
+                const prefix = m[1];
+                const holders = [...doc.querySelectorAll(`[id^="p-rc_${prefix}-"]`)]
+                    .filter(el => /^p-rc_[0-9a-f]+-\d+$/.test(el.id))
+                    .sort((a, b) => parseInt(a.id.match(/-(\d+)$/)[1], 10) - parseInt(b.id.match(/-(\d+)$/)[1], 10));
+                const idx = holders.indexOf(holder);
+                if (idx >= 0) chip.setAttribute('data-fl-skey', `${prefix}#${idx}`);
+            });
+        } catch (e) { console.error('[FL module] stampChips failed:', e); }
+    };
+
     const cleanNode = (node) => {
         if (!node) return "";
         const clone = node.cloneNode(true);
@@ -90,6 +112,7 @@
     };
 
     const extract = () => {
+        stampChips(document);
         const turns = getTurns();
         const lastTurn = turns[turns.length - 1];
         if (!lastTurn) return null;
@@ -107,6 +130,7 @@
     };
 
     const bulkExtract = () => {
+        stampChips(document);
         const turns = getTurns();
         const rounds = [];
         for (let turn of turns) {

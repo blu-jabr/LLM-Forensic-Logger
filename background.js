@@ -1,5 +1,31 @@
 console.log("[Forensic Logger] New background.js loaded successfully.");
 
+// ─── Debug tracing (module-scope, available to every breadcrumb) ───
+const FL_DEBUG = true;
+
+const flLog = [];
+const FL_LOG_MAX = 4000;
+let flPersistTimer = null;
+function bgLog(line) {
+  flLog.push(line);
+  if (flLog.length > FL_LOG_MAX) flLog.splice(0, flLog.length - FL_LOG_MAX);
+  clearTimeout(flPersistTimer);
+  flPersistTimer = setTimeout(() => chrome.storage.local.set({ flDebugLog: flLog }), 5000);
+}
+chrome.storage.local.get(['flDebugLog'], d => { if (d.flDebugLog) flLog.push(...d.flDebugLog); });
+const dlog = (...a) => {
+  const line = new Date().toISOString() + ' [BG] ' +
+    a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
+  if (FL_DEBUG) console.log('%c[FL:BG]', 'color:#008;font-weight:bold', ...a);
+  bgLog(line);
+};
+const derr = (...a) => {
+  const line = new Date().toISOString() + ' [BG✗] ' +
+    a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
+  if (FL_DEBUG) console.error('%c[FL:BG✗]', 'color:#c06;font-weight:bold', ...a);
+  bgLog(line);
+};
+
 // ─── Configuration ───
 const EMIT_ROLLING_STATE = true;    // write a state snapshot JSON after every round
 const HEDGING_FLAG_THRESHOLD = 3;   // hedging_language_count >= this flags a round for priority review
@@ -11,18 +37,23 @@ const HANDOFF_SCHEMA_VERSION = 1;
 
 let isProcessing = false;
 const logQueue = [];
+const pendingIndexEmit = new Set();   // chatIds awaiting index emission at queue drain
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  dlog('B1 message:', message.type);
+
   if (message.type === 'LOG_LLM_ROUND') {
     logQueue.push({ payload: message.payload, isBulk: false });
     processQueue();
     sendResponse({ status: 'success' });
+
   } else if (message.type === 'BULK_LOG_SESSION') {
     const { rounds, sessionName, chatId } = message.payload;
-    console.log(`[Forensic Logger] Background received bulk request for ${rounds.length} rounds.`);
+    dlog('B2 bulk:', rounds.length, 'rounds; chatId=', chatId);
 
     if (chatId) {
       // Reset the packet first, so the bulk replay rebuilds it cleanly
+      pendingIndexEmit.add(chatId);
       resetSessionPacket(chatId)
         .then(() => getSessionState(chatId, true))
         .then(() => {
@@ -35,6 +66,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               roundHtml: roundData.roundHtml || "",
               sessionName: sessionName || "Untitled Session",
               metadata: roundData.metadata || {},
+              citationChips: roundData.citationChips || [],
               chatId: chatId,
               generationDurationMs: 0,
               domNodeCount: 0,
@@ -46,10 +78,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
     }
     sendResponse({ status: 'success' });
+
   } else if (message.type === 'GENERATE_HANDOFF') {
+    dlog('H1 handoff requested:', message.chatId);
     generateHandoff(message.chatId)
       .then(res => sendResponse(res))
       .catch(e => sendResponse({ status: 'error', error: e.message }));
+    // begin addition
+  } else if (message.type === 'FL_DEBUG_LOG') {
+    (message.lines || []).forEach(l => bgLog(l));
+    sendResponse({ status: 'ok' });
+  } else if (message.type === 'DOWNLOAD_DEBUG_LOG') {
+    (async () => {
+      const { hostname } = await chrome.storage.local.get(['hostname']);
+      const HOST = hostname || 'unknown-host';
+      const now = new Date();
+      const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+
+      const n = flLog.length;
+      const text = `# LLM-Forensic-Logger debug log\n# host: ${HOST}\n# exported: ${now.toISOString()}\n# entries: ${n}\n\n` + flLog.join('\n') + '\n';
+      const url = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
+      chrome.downloads.download({ url, filename: `LLM-Forensic-Logger/${dateStr}/debug.${dateStr}.${timeStr}.${HOST}.log`, saveAs: false });
+
+      // Export-then-clear: each exported .log covers everything since the last export
+      flLog.length = 0;
+      chrome.storage.local.set({ flDebugLog: [] });
+      sendResponse({ status: 'success', entries: n });
+    })();
+    return true;
   }
   return true;
 });
@@ -59,9 +116,23 @@ async function processQueue() {
   isProcessing = true;
 
   const { payload } = logQueue.shift();
-  await logRound(payload, payload.chatId);
+  dlog('B3 processing; queue remaining:', logQueue.length);
+  try {
+    await logRound(payload, payload.chatId);
+  } catch (e) {
+    derr('B3✗ logRound threw — continuing:', e);
+  }
 
   isProcessing = false;
+  // Drain hook: when a bulk run's last round lands, emit the citation index.
+  if (logQueue.length === 0 && pendingIndexEmit.has(payload.chatId)) {
+    pendingIndexEmit.delete(payload.chatId);
+    try {
+      await emitCitationIndexFile(payload.chatId);
+    } catch (e) {
+      derr('B9✗ citation index emission failed:', e);
+    }
+  }
   if (logQueue.length > 0) setTimeout(processQueue, 100);
 }
 
@@ -124,6 +195,89 @@ async function getPacket(chatId) {
   return (data.sessionPackets || {})[chatId] || null;
 }
 
+// ─── Citation index (per-chat master reference, cumulative across sessions) ───
+// Keyed by stable_key (chunk-hash#rank — render-invariant). Raw-cid and title
+// keys are fallbacks for chips whose stable key couldn't be computed.
+
+async function mergeCitationIndex(chatId, chips, roundNum, sessionId) {
+    if (!chatId || !chips || chips.length === 0) return;
+    const data = await chrome.storage.local.get(['citationIndexes']);
+    const indexes = data.citationIndexes || {};
+    if (!indexes[chatId]) indexes[chatId] = {};
+    const idx = indexes[chatId];
+
+    for (const chip of chips) {
+        const key = chip.stable_key
+            || (chip.container_id ? 'cid:' + chip.container_id : null)
+            || ('title:' + (chip.source_title || 'unknown').toLowerCase().replace(/\s+/g, ' ').slice(0, 120));
+
+        if (!idx[key]) {
+            idx[key] = { source_title: chip.source_title || null, urls: [], cited_in: [],
+                         status: 'pending-capture', match_type: null };
+        }
+        const e = idx[key];
+        if (chip.source_title && !e.source_title) e.source_title = chip.source_title;
+
+        const urls = Array.isArray(chip.urls) ? chip.urls : (chip.url ? [chip.url] : []);
+        for (const u of urls) {
+            if (!e.urls.includes(u)) e.urls.push(u);
+        }
+        e.status = e.urls.length > 0 ? 'resolved' : 'pending-capture';
+
+        if (chip.url_match_type) e.match_type = chip.url_match_type;
+        if (chip.response_id) e.response_id = chip.response_id;
+        if (chip.chunk_id) e.chunk_id = chip.chunk_id;
+        if (chip.container_id) e.container_id_last = chip.container_id;
+
+        if (!e.cited_in.some(c => c.session_id === sessionId && c.round === roundNum)) {
+            e.cited_in.push({ session_id: sessionId, round: roundNum });
+        }
+    }
+    await chrome.storage.local.set({ citationIndexes: indexes });
+}
+
+async function emitCitationIndexFile(chatId) {
+    const data = await chrome.storage.local.get(['citationIndexes', 'hostname']);
+    const idx = (data.citationIndexes || {})[chatId];
+    if (!idx || Object.keys(idx).length === 0) { dlog('B9 citation index empty for', chatId); return; }
+
+    const HOSTNAME = data.hostname || 'unknown-host';
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+    const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
+
+    const entries = Object.entries(idx)
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+    const resolved = entries.filter(([, e]) => e.urls.length > 0).length;
+
+    const indexJson = {
+        type: 'citation_index',
+        schema_version: 1,
+        chat_id: chatId,
+        hostname: HOSTNAME,
+        generated_at_utc: now.toISOString(),
+        totals: { citations: entries.length, resolved, pending_capture: entries.length - resolved },
+        citations: entries.map(([key, e]) => ({
+            stable_key: key.startsWith('cid:') || key.startsWith('title:') ? null : key,
+            key: key,
+            source_title: e.source_title,
+            urls: e.urls,
+            status: e.status,
+            rounds_cited: e.cited_in || [],
+            match_type: e.match_type || null,
+            response_id: e.response_id || null,
+            chunk_id: e.chunk_id || null,
+            container_id_last: e.container_id_last || null
+        }))
+    };
+
+    const baseFilename = `citations.${chatId}.${dateStr}.${timeStr}.${HOSTNAME}`;
+    const url = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(indexJson, null, 2));
+    chrome.downloads.download({ url, filename: `${folderPath}${baseFilename}.json`, saveAs: false });
+    dlog('B9 citation index written:', baseFilename + '.json', `(${entries.length} citations, ${resolved} resolved, ${entries.length - resolved} pending)`);
+}
+
 async function logRound(payload, chatId) {
   const state = await getSessionState(chatId);
   state.round_number += 1;
@@ -131,6 +285,7 @@ async function logRound(payload, chatId) {
 
   const roundNum = state.round_number;
   const seqNum = String(roundNum).padStart(8, '0');
+  dlog('B4 round', roundNum, 'session', state.SESSION_ID);
 
   const { hostname } = await chrome.storage.local.get(['hostname']);
   const HOSTNAME = hostname || 'unknown-host';
@@ -154,6 +309,7 @@ async function logRound(payload, chatId) {
   const finalXhtmlContent = xhtmlContent.replace(/flush\.MEDIA_PLACEHOLDER/g, mediaDirName);
   const xhtmlUrl = 'data:application/xhtml+xml;charset=utf-8,' + encodeURIComponent(finalXhtmlContent);
 
+  dlog('B5 writing md/json/xhtml:', baseFilename);
   chrome.downloads.download({ url: mdUrl, filename: `${folderPath}${baseFilename}.md`, saveAs: false });
   chrome.downloads.download({ url: jsonUrl, filename: `${folderPath}${baseFilename}.json`, saveAs: false });
   chrome.downloads.download({ url: xhtmlUrl, filename: `${folderPath}${baseFilename}.xhtml`, saveAs: false });
@@ -162,13 +318,45 @@ async function logRound(payload, chatId) {
     payload.mediaFiles.forEach((media, idx) => {
       setTimeout(() => {
         const downloadUrl = media.directUrl || media.dataUrl;
-        if (downloadUrl) {
-          chrome.downloads.download({
-            url: downloadUrl,
-            filename: `${folderPath}${mediaDirName}/${media.filename}`,
-            saveAs: false
-          });
-        }
+        if (!downloadUrl) return;
+        chrome.downloads.download({
+          url: downloadUrl,
+          filename: `${folderPath}${mediaDirName}/${media.filename}`,
+          saveAs: false
+        }, (id) => {
+          if (id === undefined || chrome.runtime.lastError) {
+            derr('B6✗ failed:', media.filename, chrome.runtime.lastError && chrome.runtime.lastError.message);
+            return;
+          }
+
+          setTimeout(() => {
+            chrome.downloads.search({ id }, (items) => {
+              const it = items && items[0];
+              if (!it || it.state !== 'complete') { derr('B6✗ interrupted:', media.filename, it && it.state, it && it.error); return; }
+              dlog('B6✓ complete:', media.filename, it.mime, it.bytesReceived + 'B');
+              // Verify: rename to the extension the actual bytes imply
+              const mimeExt = {
+                'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
+                'image/gif': 'gif', 'application/pdf': 'pdf',
+                'video/mp4': 'mp4', 'video/webm': 'webm'
+              }[it.mime];
+              if (mimeExt && !media.filename.endsWith('.' + mimeExt)) {
+                const corrected = media.filename.replace(/\.[a-z0-9]+$/i, '.' + mimeExt);
+                chrome.downloads.remove(id, () => {         // remove the wrong-named copy
+                  chrome.downloads.download({
+                    url: downloadUrl,
+                    filename: `${folderPath}${mediaDirName}/${corrected}`,
+                    saveAs: false
+                  }, (id2) => {
+                    if (id2 !== undefined && !chrome.runtime.lastError) dlog('B6✓ renamed →', corrected);
+                    else derr('B6✗ rename failed for', corrected);
+                  });
+                });
+              }
+            });
+          }, 3000);
+
+        });
       }, idx * 200);
     });
   }
@@ -184,6 +372,7 @@ async function logRound(payload, chatId) {
     response: payload.response || "",
     metrics: jsonContent.metrics,
     media: (payload.mediaFiles || []).map(m => ({ filename: m.filename, dir: mediaDirName })),
+    citation_chips: payload.citationChips || [],
     files: {
       md: `${folderPath}${baseFilename}.md`,
       json: `${folderPath}${baseFilename}.json`,
@@ -192,12 +381,15 @@ async function logRound(payload, chatId) {
     }
   };
   const packet = await appendToPacket(chatId, packetEntry);
+  await mergeCitationIndex(chatId, payload.citationChips || [], roundNum, state.SESSION_ID);
+  dlog('B7 packet rounds:', packet.rounds.length);
 
   if (EMIT_ROLLING_STATE) {
     const stateJson = buildRollingStateJson(state, packet, payload, chatId, HOSTNAME);
     const stateUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(stateJson, null, 2));
     const stateFilename = `${folderPath}state.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}.json`;
     chrome.downloads.download({ url: stateUrl, filename: stateFilename, saveAs: false });
+    dlog('B8 state snapshot written');
   }
 }
 
@@ -232,7 +424,16 @@ function computeFlags(metrics) {
 
 function excerpt(s, n = PROMPT_EXCERPT_CHARS) {
   if (!s) return '';
-  const t = s.replace(/\s+/g, ' ').trim();
+  let t = s.replace(/\s+/g, ' ').trim();
+  // Collapse Gemini's doubled prompt rendering for handoff/state views.
+  // The raw .md files remain untouched and faithful to the DOM.
+  if (/^you said\s+/i.test(t)) t = t.replace(/^you said\s+/i, '');
+  const total = t.length;
+  for (let L = Math.floor(total / 2); L >= Math.floor(total / 2) - 2 && L > 10; L--) {
+    const sep = total - 2 * L;
+    if (sep < 0 || sep > 2) continue;
+    if (t.slice(0, L) === t.slice(L + sep)) { t = t.slice(0, L); break; }
+  }
   return t.length > n ? t.slice(0, n) + '…' : t;
 }
 
@@ -278,6 +479,7 @@ function buildRollingStateJson(sessionState, packet, payload, chatId, HOSTNAME) 
 
 async function generateHandoff(chatId) {
   const packet = await getPacket(chatId);
+  dlog('H2 packet:', packet && packet.rounds ? packet.rounds.length + ' rounds' : 'EMPTY');
   if (!packet || packet.rounds.length === 0) {
     return {
       status: 'empty',
@@ -308,6 +510,7 @@ async function generateHandoff(chatId) {
   });
 
   const url = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(md);
+  dlog('H4 writing', baseName + '.md');
   chrome.downloads.download({ url, filename: `${folderPath}${baseName}.md`, saveAs: false });
 
   return { status: 'success', rounds: rounds.length };
@@ -457,7 +660,10 @@ function createJsonMetadata(payload, sessionId, roundNum, dateStr, timeStr, host
     round_number: roundNum,
     timestamp_logged_utc: new Date().toISOString(),
     hostname: hostname,
-    gemini_metadata: payload.metadata || {},
+    gemini_metadata: {
+      ...(payload.metadata || {}),
+      citation_chips: payload.citationChips || []
+    },
     metrics: {
       resource_usage: {
         prompt_char_length: payload.prompt.length,
