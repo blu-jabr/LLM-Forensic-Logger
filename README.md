@@ -30,7 +30,7 @@ A Manifest V3 Chromium extension that performs forensic logging of LLM chat sess
 
 Other LLMs are added by dropping a module file into `modules/` (see [Adding a target](#adding-a-target)).
 
-Note: As of this initial release, Gemini is the only complete module. Other modules are just placeholders for now.
+****Note: As of this initial release, Gemini is the only complete module. Other modules are just placeholders for now.
 
 ## Installation
 
