@@ -20,8 +20,19 @@ FILES=(
   modules/google_flow.js
   modules/google-search-ai-logger.js
   modules/index.js
+  modules/inject_main_world.js
   modules/notebooklm.js
 )
+
+# Canary: the generic content script must contain no service-specific selectors.
+if grep -q 'source-inline-chip' content.js; then
+  echo "WARNING: service-specific DOM selectors found in content.js — refactor leak?"
+fi
+
+# Binary assets cannot survive a text heredoc; they are not archived.
+for ic in icons/cfi.16.png icons/cfi.32.png icons/cfi.48.png icons/cfi.128.png; do
+  [ -f "$ic" ] || echo "WARNING: $ic missing — manifest.json references it; copy icons/ manually when restoring from this archive."
+done
 
 OUT="plugin.txt"
 : > "$OUT"

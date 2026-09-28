@@ -34,3 +34,9 @@ Here is an example of the required format for a ChatGPT module:
     })();
     
 Please generate the equivalent file for [INSERT LLM NAME]. Use your knowledge of [INSERT LLM NAME]'s DOM structure, or use standard semantic HTML querying to find the most likely containers for user messages and AI responses. Name the module window.ForensicModules.[insert_module_name].
+
+Optional module extensions (all hook sites are guarded — omit if unneeded):
+3. processParsedDoc(doc, { isPromptSection, chips }): called on each parsed
+   section before markdown conversion; may rewrite the doc and push records
+   into ctx.chips (see modules/gemini.js for the citation-chip example).
+4. bulkPreExtract(): async, called once before bulkExtract().

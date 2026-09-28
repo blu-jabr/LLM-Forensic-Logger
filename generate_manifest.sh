@@ -25,6 +25,11 @@ for file in "$MODULES_DIR"/*.js; do
     if [ "$filename" == "index.js" ]; then
         continue
     fi
+    # MAIN-world scripts are wired separately in manifest.json entry [1];
+    # they must not be loaded into the isolated world as well.
+    if grep -q '@world MAIN' "$file"; then
+        continue
+    fi
 
     # Add to JS array
     JS_FILES+=("$file")
