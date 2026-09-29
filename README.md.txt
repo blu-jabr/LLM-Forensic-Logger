@@ -4,18 +4,16 @@ A Manifest V3 Chromium extension that performs forensic logging of LLM chat sess
 
 ```text
 ~/Downloads/LLM-Forensic-Logger/
-└── 2026-09-29/
-    ├── flush.72dd89c0-….zai.2026-09-29.10-15-06.sugarloaf.00000001.md      # round log (GFM)
-    ├── flush.72dd89c0-….zai.2026-09-29.10-15-06.sugarloaf.00000001.json    # metrics + provenance
-    ├── flush.72dd89c0-….zai.2026-09-29.10-15-06.sugarloaf.00000001.xhtml   # pristine DOM snapshot
-    ├── flush.72dd89c0-….zai.2026-09-29.10-15-06.sugarloaf.00000001.d/      # media + attachments
-    │   ├── nessus.v3.txt
-    │   └── alien.prime.jpg
-    ├── state.72dd89c0-….zai.2026-09-29.10-15-07.sugarloaf.00000005.json   # rolling cumulative state
-    ├── handoff.72dd89c0-….zai.2026-09-29.10-16-00.sugarloaf.md            # mechanical session summary
-    ├── download-manifest.2026-09-29.10-16-41.sugarloaf.json               # all profile download records
-    ├── citations.{chatId}.json                                            # citation master index (when citations exist)
-    └── debug.2026-09-29.10-16-44.sugarloaf.txt                            # breadcrumb audit trail
+└── 2026-09-23/
+    ├── flush.5c176eed-....2026-09-23.00-49-52.sugarloaf.00000001.md      # round log (GFM)
+    ├── flush.5c176eed-....2026-09-23.00-49-52.sugarloaf.00000001.json    # metrics + provenance
+    ├── flush.5c176eed-....2026-09-23.00-49-52.sugarloaf.00000001.xhtml   # pristine DOM snapshot
+    ├── flush.5c176eed-....2026-09-23.00-49-52.sugarloaf.00000001.d/      # media for this round
+    │   └── media-1.jpg
+    ├── state.5c176eed-....json                                           # rolling cumulative state
+    ├── handoff.5c176eed-....md                                           # mechanical session summary
+    ├── citations.{chatId}.json                                           # citation master index
+    └── debug.2026-09-23.00-49-52.sugarloaf.log                           # breadcrumb audit trail
 ```
 
 ## Supported targets
@@ -23,7 +21,6 @@ A Manifest V3 Chromium extension that performs forensic logging of LLM chat sess
 | Target | Module | Notes |
 |---|---|---|
 | Google Gemini | `modules/gemini.js` | Most complete: citations, media, thinking hooks |
-| Z.AI (chat.z.ai) | modules/zai.js | Complete: rounds, thinking (auto-expand/restore in bulk), text+image attachment harvesting, per-round status |
 | ChatGPT | `modules/chatgpt.js` | Includes o-series reasoning blocks |
 | Claude | `modules/claude.js` | Includes thinking blocks |
 | NotebookLM | `modules/notebooklm.js` | |
@@ -33,7 +30,7 @@ A Manifest V3 Chromium extension that performs forensic logging of LLM chat sess
 
 Other LLMs are added by dropping a module file into `modules/` (see [Adding a target](#adding-a-target)).
 
-**Note**: Gemini and Z.AI are complete modules. The remaining modules are first drafts and likely need extensive rework against live DOM samples (see HOWTO_add_new_LLM_model.md for the process).
+**Note**: As of this initial release, Gemini is the only complete module. Other modules are just placeholders for now.
 
 ## Installation
 
@@ -51,9 +48,7 @@ Once installed, every round in a supported LLM tab is logged as it completes —
 
 ### Bulk session logging
 
-1. **Reload the page**, then scroll through the entire conversation to the top (the Gemini virtual scroller only holds ~10 rounds in the DOM at a time; reload → scroll-through is the full-capture ritual. Z.AI: reload and bulk; virtualization unverified at length).
-
-
+1. **Reload the page**, then scroll through the entire conversation to the top (the virtual scroller only holds ~10 rounds in the DOM at a time; reload → scroll-through is the full-capture ritual).
 2. Click the extension icon → **Log Entire Session**.
 3. Every round is written with fresh session ID and sequence numbers starting at `00000001`.
 
@@ -71,7 +66,7 @@ Click **Generate Handoff Document** to emit a mechanical summary of the session 
 
 ### Debug log
 
-Click **Download Debug Log** to export the extension's breadcrumb audit trail (content-script + service-worker events, timestamped) as a single `.txt` file. Export-then-clear: each log covers everything since the previous export.
+Click **Download Debug Log** to export the extension's breadcrumb audit trail (content-script + service-worker events, timestamped) as a single `.log` file. Export-then-clear: each log covers everything since the previous export.
 
 ## Architecture
 
@@ -91,8 +86,8 @@ Click **Download Debug Log** to export the extension's breadcrumb audit trail (c
          ▲ postMessage relay (cross-frame)
 ┌────────┴─────────────────── webpage (MAIN world) ────────────────────────────┐
 │ modules/inject_main_world.js   wraps window.open, patches a.click(),         │
-│   listens click + auxclick (middle-button) via composedPath(), relays        │
-│   citation navigations to the isolated world                                 │
+│   listens click + auxclick (middle-button) via composedPath(), relays         │
+│   citation navigations to the isolated world                                  │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -137,8 +132,6 @@ Every URL carries `url_match_type` provenance. Multi-citation chips (one chip, s
 }
 ```
 
-Service metadata nests under `gemini_metadata` for all services (frozen-file key, kept for consumer compatibility)."
-
 ## Gemini DOM notes
 
 Hard-won facts encoded in the code — do not relearn them:
@@ -168,7 +161,7 @@ Create `modules/<name>.js` following the existing pattern:
 
 Then add the file to the `content_scripts.js` array in `manifest.json` and add the match patterns to `content_scripts.matches`.
 
-**manifest.json is header-owned**. `generate_manifest.sh` regenerates `content_scripts[0].js` matches and host_permissions from module header comments (`// @match`, `// @host_permissions`).  It is dry-run by default and refuses to write if any current manifest entry is owned by no module header (orphan guard), backs up before writing. To add a service: declare its patterns in the module header, run `./generate_manifest.sh`, review,then `./generate_manifest.sh --write`.  Non-entry-[0] wiring (e.g. the MAIN-world injector) remains hand-maintained.
+> ⚠️ **`manifest.json` is hand-maintained.** The historical `generate_manifest.sh` regenerates the arrays from module headers but will strip icons, `unlimitedStorage`, and the MAIN-world content-script entry. Do not run it against the current manifest.
 
 ## Development
 
@@ -187,29 +180,26 @@ Then add the file to the `content_scripts.js` array in `manifest.json` and add t
 - Citation capture is manual by design. (Playwright automation is a future possibility; requires Google auth in an automated browser.)
 - Extension storage is per-browser-profile; clearing site data or removing the extension erases caches, sessions, and the hostname.
 
-**Z.AI specifics**:
-
-- Attachment CDN signatures are short-lived (~minutes, observed ~8): harvesting must happen at render time on a freshly loaded page; stored URLs 403 for every fetcher, including `chrome.downloads`.
-- PDF attachments are recorded (filename/kind/size, honest placeholder) but not harvested — the chip triggers a direct download from a URL that never appearsin the DOM.
-- The site injects a server-side wrapper (incl. an unconditional "Please help me:" line) around text attachments before model inference; the wrapper is invisible in the transcript, so the DOM capture is faithful to what the page showed but not to what the model received (reported upstream 2026-09-30). A MAIN-world wire-capture hook is the planned remediation.
-- Whether the transcript virtualizes at long lengths is unverified (bulk coverage confirmed only at ~39 rounds).
-
 ## Repository layout
 
 ```
 LLM-Forensic-Logger/
-├── manifest.json              # v1.32 — header-owned; regenerate via generate_manifest.sh
-├── ...
+├── manifest.json              # v1.28 — HAND-MAINTAINED
+├── background.js              # service worker: queue, state, handoff, index, media, debug
+├── content.js                 # orchestrator: live/bulk extraction, HTML→MD, citations
+├── popup.html / popup.js      # Log Entire Session · Generate Handoff · Download Debug Log
+├── options.html / options.js  # hostname configuration (cached)
+├── modules/
+│   ├── index.js               # window.ForensicModules = {}
+│   ├── inject_main_world.js   # MAIN-world navigation interceptor (Gemini)
 │   ├── gemini.js              # includes stampChips() + getSessionName()
-│   ├── zai.js                 # rounds, thinking, attachment harvesting (text + image)
 │   ├── chatgpt.js  claude.js  duckai.js  notebooklm.js
 │   ├── google-search-ai-logger.js  google_flow.js
-├── generate_manifest.sh       # header-driven manifest regeneration (dry-run default)
-├── notes/                     # console snippets, syntax_check.sh, rescue_attachments.py
+├── generate_manifest.sh       # legacy; see warning above
+├── notes/                     # console snippets, storage dumps, syntax_check.sh
+└── icons/
 ```
 
 ## Privacy & forensic stance
 
-All processing and storage is local. The extension makes no third-party network requests; its only outbound fetches are attachment files from the chat service's own asset CDN (scoped by host_permissions), performed during explicit harvesting. Media otherwise downloads via the browser's download manager against URLs already present in the page.
-
-Logs are written under the user's Downloads directory in a `LLM-Forensic-Logger/` namespace. The design principle throughout: **record what the page actually showed, preserve original URLs alongside local copies, flag uncertainty instead of resolving it silently, and never summarize what can be quoted.**
+All processing and storage is local. The extension makes no network requests of its own; media downloads use the browser's download manager against URLs already present in the page. Logs are written under the user's Downloads directory in a `LLM-Forensic-Logger/` namespace. The design principle throughout: **record what the page actually showed, preserve original URLs alongside local copies, flag uncertainty instead of resolving it silently, and never summarize what can be quoted.**

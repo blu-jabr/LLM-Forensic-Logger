@@ -1,4 +1,4 @@
-# How to add a new LLM service (v1.29 architecture)
+# How to add a new LLM service (v1.32 architecture)
 
 I am building a Chromium MV3 extension that logs LLM chats round-by-round to
 local files. You will generate ONE new module file for a service. Do not
@@ -64,7 +64,7 @@ Optional hooks (all call sites are guarded — omit if unneeded):
 
 ## Also required (not optional)
 
-- manifest.json, version [CURRENT_VERSION] -> bump minor:
+- manifest.json, version [CURRENT_VERSION] -> bump version:
     a. add the service's match patterns to "host_permissions"
     b. add them to "content_scripts"[0]."matches"
     c. add "modules/[insert_module_name].js" to "content_scripts"[0]."js",
@@ -72,6 +72,14 @@ Optional hooks (all call sites are guarded — omit if unneeded):
 - make_plugin.sh: add the new file to the FILES list.
 - Run node --check on the new file; then ./make_plugin.sh and confirm the
   chunk count matches.
+- Declare the service's patterns in the module header (@match / @host_permissions).
+- Run `./generate_manifest.sh` (dry run) — review — then `--write`. Do not hand-edit
+  `manifest.json``; the orphan guard is the drift detector.
+- `make_plugin.sh`: add the new file to the FILES list.
+- popup.js: add the host to the SUPPORTED regex (D8).
+- Run node --check on the new file; then ./make_plugin.sh and confirm the chunk count.
+
+(This also updates D8's "4th touchpoint" framing: the per-service checklist is now **module file with headers → make_plugin FILES → popup SUPPORTED**, with manifest generation automated.)
 
 ## Example skeleton (isolated world, sync extract)
 
@@ -124,7 +132,7 @@ Optional hooks (all call sites are guarded — omit if unneeded):
   touching content.js or background.js, stop and say so — there is probably
   an existing hook, or one can be added deliberately.
 
-## Deviation ledger — deliberate frozen-file modifications (as of v1.30, post zai bring-up)
+## Deviation ledger — deliberate frozen-file modifications (current through v1.32)
 
 The architecture froze content.js and background.js. The following aredeliberate, reviewed deviations. New service modules must assume they exist.
 
@@ -147,6 +155,11 @@ Module conventions to copy into new services (see modules/zai.js as reference):
 - header comment block tracking VERIFIED vs PROVISIONAL selectors, updated as DOM samples arrive
 - per-round try/catch inside bulkExtract so one bad round can't kill the run
 - active-harvester hooks (`bulkPreExtract`) for UI-only data (chips, viewers)
+- Module headers own ALL manifest permissions, including fetch-only ones that 
+  never appear in content_scripts.matches (e.g. zai.js declares// @host_permissions  
+  *://z-cdn-media.chatglm.cn/* for its asset CDN).generate_manifest.sh enforces this: any manifest entry without a header 
+  owner blocks --write.
+
 
 Process notes learned the hard way:
 
@@ -201,9 +214,12 @@ Appends to the ledger above. Numbering continues at D10.
 - **expandCollapsedThinking**: test ALL descendant svgs for `-rotate-90` — toggle
   buttons hold TWO svgs (icon + chevron); first-svg querySelector silently matches
   nothing.
-- **Asset constraints**: content.js blob cap 10 MB; SW FETCH_ASSET cap 25 MB; signed
-  CDN URLs (`auth_key` epoch) expire ~24 h — harvest at render time only; stored
-  URLs 403 for every fetcher including chrome.downloads.
+- **Asset constraints**: content.js blob cap 10 MB; SW FETCH_ASSET cap 25 MB; signed 
+  CDN URLs (`auth_key` epoch) are **short-lived (~minutes; observed ~8 min remaining 
+  at click on a fresh page)** — harvest at render time on a freshly loaded page only; 
+  stored URLs 403 for every fetcher including chrome.downloads. Signed URLs have been 
+  observed captured incidentally in the site's own RUM beacons (aliyuncs) — a useful 
+  forensic source; stored URLs 403 for every fetcher including chrome.downloads.
 - **setStatus(msg, level)**: level `'error'` reserved for real failures; popup colors
   red only on error, green otherwise, amber for warnings.
 
@@ -239,4 +255,4 @@ attachment rounds** — every DOM-based logger under-captures. Full report filed
 repro, ordering/two-file probes, and wire evidence. Planned remediation = Track 2:
 MAIN-world fetch hook (pattern: modules/inject_main_world.js) capturing completion
 POSTs → per-round true submitted payload, plus per-attachment signed file URLs
-(retiring the 24 h expiry problem and the PDF gap in one build).
+(retiring the short-signature-lifetime problem).
