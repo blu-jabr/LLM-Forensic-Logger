@@ -9,37 +9,12 @@ function bindButton(id, fn) {
   el.addEventListener('click', fn);
 }
 
-const SUPPORTED = /chatgpt\.com|chat\.openai\.com|claude\.ai|duck\.ai|gemini\.google\.com|labs\.google|notebooklm\.google\.com|www\.google\.com\/search|chat\.z\.ai/;
-
-// Live progress: modules write {bulkStatus} to chrome.storage.local; poll it
-// into the status line while a bulk run is in flight.
-let statusPoll = null;
-function startStatusPolling() {
-  if (statusPoll) return;
-  statusPoll = setInterval(async () => {
-    try {
-      const { bulkStatus } = await chrome.storage.local.get(['bulkStatus']);
-
-      if (bulkStatus && bulkStatus.message) {
-        setStatus(bulkStatus.message, bulkStatus.level === 'error' ? 'red' : 'green');
-      }
-
-    } catch (e) { /* popup closing */ }
-  }, 400);
-}
-function stopStatusPolling() {
-  if (statusPoll) { clearInterval(statusPoll); statusPoll = null; }
-}
+const SUPPORTED = /chatgpt\.com|chat\.openai\.com|claude\.ai|duck\.ai|gemini\.google\.com|labs\.google|notebooklm\.google\.com|www\.google\.com\/search|chat.z.ai/
 
 function sendBulk(tab) {
-  startStatusPolling();
-  setStatus('Extracting…', 'green');
   chrome.tabs.sendMessage(tab.id, { type: 'BULK_LOG_REQUEST' }, (response) => {
-    stopStatusPolling();
     if (chrome.runtime.lastError) setStatus('Error: Please refresh the page!', 'red');
-    else if (response && response.status === 'error') setStatus('Error: ' + (response.error || 'unknown'), 'red');
-    else if (response && response.status === 'no_module_matched') setStatus('No module matched this page.', 'red');
-    else setStatus('Done — check downloads.', 'green');
+    else setStatus('Extracting... Check downloads.');
     setTimeout(() => window.close(), 3000);
   });
 }
@@ -48,6 +23,8 @@ bindButton('bulkLog', () => {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const tab = tabs && tabs[0];
     if (tab && SUPPORTED.test(tab.url || '')) { sendBulk(tab); return; }
+    // Active tab isn't a supported LLM page (e.g., you followed a citation link).
+    // Find any supported tab instead.
     chrome.tabs.query({}, (all) => {
       const cand = all.find(t => SUPPORTED.test(t.url || ''));
       if (!cand) setStatus('No supported LLM tab found.', 'red');
@@ -55,6 +32,7 @@ bindButton('bulkLog', () => {
     });
   });
 });
+
 
 bindButton('handoff', () => {
   const requestHandoff = (tab) => {
@@ -78,6 +56,7 @@ bindButton('handoff', () => {
     if (tab && SUPPORTED.test(tab.url || '')) { requestHandoff(tab); return; }
     chrome.tabs.query({}, (all) => {
       const cands = all.filter(t => SUPPORTED.test(t.url || ''));
+      // Prefer a Gemini chat tab — handoff needs a real chatId
       const cand = cands.find(t => /gemini\.google\.com\/app\//.test(t.url || '')) || cands[0];
       if (!cand) setStatus('No supported LLM tab found.', 'red');
       else requestHandoff(cand);
@@ -85,13 +64,6 @@ bindButton('handoff', () => {
   });
 });
 
-bindButton('dlManifest', () => {
-  chrome.runtime.sendMessage({ type: 'EXPORT_DOWNLOAD_MANIFEST' }, (res) => {
-    if (chrome.runtime.lastError || !res || !res.ok) setStatus('Manifest failed: ' + ((res && res.error) || '?'), 'red');
-    else setStatus('Manifest written (' + res.entries + ' matching downloads).');
-    setTimeout(() => window.close(), 2500);
-  });
-});
 
 bindButton('debugLog', () => {
   chrome.runtime.sendMessage({ type: 'DOWNLOAD_DEBUG_LOG' }, (res) => {

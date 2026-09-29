@@ -1,40 +1,43 @@
 #!/bin/bash
+# generate_manifest.sh — regenerate content_scripts[0].js/matches and
+# host_permissions from modules/*.js header comments.
+#
+# Sources of truth:
+#   modules/*.js headers:  // @match <pattern>
+#                          // @host_permissions <pattern>
+#   Files containing '@world MAIN' are excluded from entry [0] (their
+#   manifest wiring lives in hand-maintained entries like [1]).
+#
+# Safety: DRY RUN by default. Writes only with --write, and only if the
+# derived sets lose NOTHING currently present (orphan guard). Backs up
+# manifest.json before writing.
 
-# Ensure jq is installed
-if ! command -v jq &> /dev/null; then
-    echo "Error: jq is not installed. Please install it first (e.g., sudo apt install jq or brew install jq)."
-    exit 1
-fi
+set -euo pipefail
 
 MANIFEST="manifest.json"
 MODULES_DIR="modules"
+WRITE=0
+[ "${1:-}" = "--write" ] && WRITE=1
 
-if [ ! -f "$MANIFEST" ]; then
-    echo "Error: $MANIFEST not found!"
-    exit 1
-fi
+command -v jq >/dev/null || { echo "Error: jq not installed"; exit 1; }
+[ -f "$MANIFEST" ] || { echo "Error: $MANIFEST not found"; exit 1; }
 
-# Initialize arrays
 JS_FILES=("modules/index.js")
 MATCHES=()
 HOST_PERMS=()
+MAIN_FILES=()
 
-# Read through all module files (excluding index.js)
 for file in "$MODULES_DIR"/*.js; do
     filename=$(basename "$file")
-    if [ "$filename" == "index.js" ]; then
-        continue
-    fi
-    # MAIN-world scripts are wired separately in manifest.json entry [1];
-    # they must not be loaded into the isolated world as well.
+    [ "$filename" = "index.js" ] && continue
+
     if grep -q '@world MAIN' "$file"; then
-        continue
+        MAIN_FILES+=("$file")
+        continue   # MAIN-world: wired in separate manifest entries, not [0]
     fi
 
-    # Add to JS array
     JS_FILES+=("$file")
 
-    # Extract @match and @host_permissions comments
     while IFS= read -r line; do
         if [[ "$line" =~ @match\ (.*) ]]; then
             MATCHES+=("${BASH_REMATCH[1]}")
@@ -44,22 +47,66 @@ for file in "$MODULES_DIR"/*.js; do
     done < "$file"
 done
 
-# Add content.js last
 JS_FILES+=("content.js")
 
-# Convert bash arrays to JSON arrays using jq
+# Normalize: sort + dedup (stable diffs, duplicate-header detection)
+norm() { printf '%s\n' "$@" | sort -u; }
+DERIVED_MATCHES=$(norm "${MATCHES[@]}")
+DERIVED_PERMS=$(norm "${HOST_PERMS[@]}")
+
+# Current manifest sets
+CUR_MATCHES=$(jq -r '.content_scripts[0].matches[]' "$MANIFEST" | sort -u)
+CUR_PERMS=$(jq -r '.host_permissions[]' "$MANIFEST" | sort -u)
+
+# ── Orphan guard: derived set must not LOSE anything current ──
+LOST_MATCHES=$(comm -23 <(echo "$CUR_MATCHES") <(echo "$DERIVED_MATCHES"))
+LOST_PERMS=$(comm -23 <(echo "$CUR_PERMS") <(echo "$DERIVED_PERMS"))
+
+fail=0
+if [ -n "$LOST_MATCHES" ]; then
+    echo "⚠ ORPHANED matches (in manifest, owned by no module header):"
+    echo "$LOST_MATCHES"; fail=1
+fi
+if [ -n "$LOST_PERMS" ]; then
+    echo "⚠ ORPHANED host_permissions (in manifest, owned by no module header):"
+    echo "$LOST_PERMS"; fail=1
+fi
+if [ $fail -eq 1 ]; then
+    echo ""
+    echo "Fix: add the missing '// @match' or '// @host_permissions' line(s)"
+    echo "to the owning module's header — or accept the loss deliberately by"
+    echo "removing them from manifest.json first."
+    [ $WRITE -eq 1 ] && echo "REFUSING to write (--write given, orphans present)."
+    exit 2
+fi
+
+# ── Report additions + MAIN-world check ──
+NEW_MATCHES=$(comm -13 <(echo "$CUR_MATCHES") <(echo "$DERIVED_MATCHES"))
+NEW_PERMS=$(comm -13 <(echo "$CUR_PERMS") <(echo "$DERIVED_PERMS"))
+[ -n "$NEW_MATCHES$NEW_PERMS" ] && { echo "New from headers:"; [ -n "$NEW_MATCHES" ] && echo "$NEW_MATCHES"; [ -n "$NEW_PERMS" ] && echo "$NEW_PERMS"; }
+
+for f in "${MAIN_FILES[@]:-}"; do
+    [ -z "$f" ] && continue
+    host=$(grep -oP '@match \K.*' "$f" | head -1)
+    grep -qF "\"$host\"" <(jq -r '.content_scripts[1].matches[]' "$MANIFEST") \
+        || echo "⚠ MAIN-world file $f host '$host' not found in content_scripts[1].matches (hand-maintained entry)"
+done
+
+# ── Build and (maybe) write ──
 JS_JSON=$(printf '%s\n' "${JS_FILES[@]}" | jq -R . | jq -s .)
-MATCHES_JSON=$(printf '%s\n' "${MATCHES[@]}" | jq -R . | jq -s .)
-HOST_PERMS_JSON=$(printf '%s\n' "${HOST_PERMS[@]}" | jq -R . | jq -s .)
+M_JSON=$(echo "$DERIVED_MATCHES" | jq -R . | jq -s .)
+H_JSON=$(echo "$DERIVED_PERMS" | jq -R . | jq -s .)
 
-# Update manifest.json safely using jq
-jq \
-  --argjson js "$JS_JSON" \
-  --argjson matches "$MATCHES_JSON" \
-  --argjson host_perms "$HOST_PERMS_JSON" \
+if [ $WRITE -eq 0 ]; then
+    echo "DRY RUN — no changes. Derived js order:"
+    printf '  %s\n' "${JS_FILES[@]}"
+    echo "Run with --write to apply."
+    exit 0
+fi
+
+cp "$MANIFEST" "manifest.json.bak.$(date +%s.%T)"
+jq --argjson js "$JS_JSON" --argjson matches "$M_JSON" --argjson host_perms "$H_JSON" \
   '.content_scripts[0].js = $js | .content_scripts[0].matches = $matches | .host_permissions = $host_perms' \
-  "$MANIFEST" > "manifest.tmp.json"
-
-mv "manifest.tmp.json" "$MANIFEST"
-
-echo "✅ manifest.json successfully updated with modules from $MODULES_DIR/"
+  "$MANIFEST" > manifest.tmp.json
+mv manifest.tmp.json "$MANIFEST"
+echo "✅ manifest.json updated (backup: manifest.json.bak.*)"

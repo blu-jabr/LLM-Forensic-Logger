@@ -1,0 +1,6 @@
+{
+    "llm_name": "Z.AI",
+    "llm_url": "https:/chat.z.ai",
+    "module_name": "zai",
+    "current_version": "1.29"
+}

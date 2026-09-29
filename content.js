@@ -100,7 +100,8 @@ async function processLatestRound(durationMs) {
                 chatId: window.location.pathname.split('/').pop(),
                 generationDurationMs: durationMs,
                 domNodeCount: document.getElementsByTagName('*').length,
-                origin: window.location.origin
+                origin: window.location.origin,
+                module: matchedModuleName
             };
 
             if (chrome.runtime && chrome.runtime.id) {
@@ -113,7 +114,7 @@ async function processLatestRound(durationMs) {
             }
         }
     } catch (error) {
-        console.error('[Forensic Logger] Error processing round:', error);
+        derr('[Forensic Logger] Error processing round:', error);
     } finally {
         isLogging = false;
     }
@@ -164,13 +165,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             payload: {
                                 rounds: processedRounds,
                                 sessionName: sessionName,
-                                chatId: window.location.pathname.split('/').pop()
+                                chatId: window.location.pathname.split('/').pop(),
+                                module: moduleName
                             }
                         });
                         dlog('B5 delivered to background');
                         sendResponse({ status: 'success' });
                     } catch (e) {
-                        console.error("[Forensic Logger] Bulk log failed:", e);
+                        derr("[Forensic Logger] Bulk log failed:", e);
                         sendResponse({ status: 'error', error: e.message });
                     } finally {
                         isBulkLogging = false;
@@ -250,6 +252,14 @@ async function processHtmlAndMedia(data, modRef) {
                     else if (blob.type.includes('webm')) ext = 'webm';
                     else if (blob.type.includes('pdf')) ext = 'pdf';
                     else if (blob.type.includes('svg')) ext = 'svg';
+                    else if (blob.type.startsWith('text/')) {
+                      const sub = blob.type.split('/')[1].split(';')[0];
+                      const textExt = { plain: 'txt', markdown: 'md', 'x-sh': 'sh', 'x-shellscript': 'sh',
+                        'x-python': 'py', javascript: 'js', css: 'css', xml: 'xml', csv: 'csv',
+                        html: 'html', 'x-yaml': 'yaml' }[sub];
+                      ext = textExt || 'txt';
+                    }
+                    else if (blob.type === 'application/json') ext = 'json';
                 } else {
                     if (url.match(/\.([a-z0-9]{2,4})(\?|$)/i)) {
                         const extMatch = url.match(/\.([a-z0-9]{2,4})(\?|$)/i);
@@ -301,7 +311,7 @@ async function processHtmlAndMedia(data, modRef) {
                     el.setAttribute('href', `flush.MEDIA_PLACEHOLDER/${filename}`);
                 }
             } catch (e) {
-                console.error("[Forensic Logger] Failed to process media:", url, e);
+                derr("[Forensic Logger] Failed to process media:", url, e);
             }
         }
 

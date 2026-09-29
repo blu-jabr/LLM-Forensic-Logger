@@ -48,7 +48,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ status: 'success' });
 
   } else if (message.type === 'BULK_LOG_SESSION') {
-    const { rounds, sessionName, chatId } = message.payload;
+    const { rounds, sessionName, chatId, module: serviceModule } = message.payload;
     dlog('B2 bulk:', rounds.length, 'rounds; chatId=', chatId);
 
     if (chatId) {
@@ -70,7 +70,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               chatId: chatId,
               generationDurationMs: 0,
               domNodeCount: 0,
-              origin: sender.tab ? sender.tab.url : 'unknown'
+              module: serviceModule || 'unknown',
+              origin: sender.tab ? sender.tab.url : 'unknown',
             };
             logQueue.push({ payload, isBulk: true });
           });
@@ -105,6 +106,56 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       flLog.length = 0;
       chrome.storage.local.set({ flDebugLog: [] });
       sendResponse({ status: 'success', entries: n });
+    })();
+    return true;
+  } else if (message.type === 'EXPORT_DOWNLOAD_MANIFEST') {
+    (async () => {
+      try {
+        const items = await chrome.downloads.search({limit: 100000});           // ALL profile downloads
+        // NEW (everything except our own synthetic downloads, with a cdnMatch flag):
+        const recs = items
+          .filter(it => !/^(data:|blob:|chrome-extension:)/i.test(it.url || ''))
+          .map(it => ({
+            onDisk: it.filename,
+            basename: (it.filename || '').split(/[\\/]/).pop(),
+            url: it.url, finalUrl: it.finalUrl,
+            mime: it.mime, bytes: it.fileSize, state: it.state,
+            startTime: it.startTime, referrer: it.referrer || null,
+            byExtension: it.byExtensionId || null,
+            cdnMatch: /z-cdn-media\.chatglm\.cn/i.test(it.finalUrl || it.url || ''),
+          }));
+
+        const { hostname } = await chrome.storage.local.get(['hostname']);
+        const HOST = hostname || 'unknown-host';
+        const now = new Date();
+        const ds = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+        const ts = `${String(now.getHours()).padStart(2,'0')}-${String(now.getMinutes()).padStart(2,'0')}-${String(now.getSeconds()).padStart(2,'0')}`;
+        const text = JSON.stringify({ type: 'download_manifest', hostname: HOST,
+          exported: now.toISOString(), downloads: recs }, null, 2);
+        chrome.downloads.download({ url: 'data:application/json;charset=utf-8,' + encodeURIComponent(text),
+          filename: `LLM-Forensic-Logger/${ds}/download-manifest.${ds}.${ts}.${HOST}.json`, saveAs: false });
+        sendResponse({ ok: true, entries: recs.length });
+      } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+    })();
+    return true;
+  } else if (message.type === 'FETCH_ASSET') {
+    // D10: CORS bypass for the asset CDN. The SW's fetch ignores page CORS
+    // for hosts in host_permissions. Returns a data: URL (messages are
+    // JSON-serialized; binary can't ride through directly).
+    (async () => {
+      try {
+        const r = await fetch(message.url);
+        if (!r.ok) { sendResponse({ ok: false, error: 'HTTP ' + r.status }); return; }
+        const blob = await r.blob();
+        if (blob.size > 25 * 1024 * 1024) { sendResponse({ ok: false, error: 'over 25MB SW cap' }); return; }
+        const dataUrl = await new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onloadend = () => res(fr.result);
+          fr.onerror = () => rej(fr.error);
+          fr.readAsDataURL(blob);
+        });
+        sendResponse({ ok: true, dataUrl, mime: blob.type || '' });
+      } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     })();
     return true;
   }
@@ -280,6 +331,7 @@ async function emitCitationIndexFile(chatId) {
 
 async function logRound(payload, chatId) {
   const state = await getSessionState(chatId);
+  const SERVICE = String(payload.module || 'unknown').replace(/[^a-z0-9_-]/gi, '');
   state.round_number += 1;
   await saveSessionState(chatId, state);
 
@@ -294,7 +346,7 @@ async function logRound(payload, chatId) {
   const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
 
-  const baseFilename = `flush.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+  const baseFilename = `flush.${state.SESSION_ID}.${SERVICE}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
   const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
   const mediaDirName = `${baseFilename}.d`;
 
@@ -366,6 +418,7 @@ async function logRound(payload, chatId) {
     round: roundNum,
     timestamp_utc: jsonContent.timestamp_logged_utc,
     session_id: state.SESSION_ID,
+    service: payload.module || null,
     session_name: payload.sessionName || null,
     prompt: payload.prompt || "",
     thinking: payload.thinking || "",
@@ -387,7 +440,7 @@ async function logRound(payload, chatId) {
   if (EMIT_ROLLING_STATE) {
     const stateJson = buildRollingStateJson(state, packet, payload, chatId, HOSTNAME);
     const stateUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(stateJson, null, 2));
-    const stateFilename = `${folderPath}state.${state.SESSION_ID}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}.json`;
+    const stateFilename = `${folderPath}state.${state.SESSION_ID}.${SERVICE}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}.json`;
     chrome.downloads.download({ url: stateUrl, filename: stateFilename, saveAs: false });
     dlog('B8 state snapshot written');
   }
@@ -492,14 +545,14 @@ async function generateHandoff(chatId) {
 
   const rounds = packet.rounds;
   const last = rounds[rounds.length - 1];
-  const sessionId = packet.session_id || 'no-session-id';
+  const sessionId = packet.session_id || 'no-session-id';          // already exists
+  const svc = (last && last.service) || 'unknown';
 
   const now = new Date();
   const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   const timeStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
-  const seqNum = String(last.round).padStart(8, '0');
   const folderPath = `LLM-Forensic-Logger/${dateStr}/`;
-  const baseName = `handoff.${sessionId}.${dateStr}.${timeStr}.${HOSTNAME}.${seqNum}`;
+  const baseName = `handoff.${sessionId}.${svc}.${dateStr}.${timeStr}.${HOSTNAME}`;
 
   const md = buildHandoffMarkdown({
     sessionId,

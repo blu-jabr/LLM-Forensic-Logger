@@ -111,6 +111,7 @@
     let pendingOpenQueue = [];
 
     function harvestCitationUrls(root) {
+        if (!/gemini\.google\.com$/.test(location.hostname)) return;   // ← add
         try {
             if (!root || !root.querySelectorAll) return;
             const scope = root.closest ? (root.closest('[role="dialog"], .cdk-overlay-container') || root) : root;

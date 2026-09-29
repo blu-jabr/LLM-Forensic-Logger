@@ -22,6 +22,7 @@ FILES=(
   modules/index.js
   modules/inject_main_world.js
   modules/notebooklm.js
+  modules/zai.js
 )
 
 # Canary: the generic content script must contain no service-specific selectors.
