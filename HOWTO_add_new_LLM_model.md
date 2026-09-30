@@ -167,6 +167,7 @@ Process notes learned the hard way:
 - Verify what Chrome actually loaded before debugging logic:`chrome.runtime.getManifest()` from the correct extension's SW console.
 - One popup click per bulk run; each run resets the packet and mints a new SESSION_ID.
 - Get module function stacks via the extension-context console:`await window.ForensicModules.<key>.extract()` / `.bulkExtract()`.
+- Never attach-and-forget: `diff` received/produced files against their sources, and grep only the current run's SESSION_ID files — stale output from earlier runs has repeatedly impersonated fresh results (403-fossil downloads, old-session .md files).
 
 ---
 
