@@ -68,6 +68,59 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const isVisible = (el) => !!(el.getClientRects && el.getClientRects().length);
 
+  // ------------------------------------------------------------------
+  // Wire capture receiver (D14) — chat-data batches from inject_zai_wire.js
+  // ------------------------------------------------------------------
+
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  const wireData = { messages: {}, batches: 0, lastBatchAt: null };
+  const wireFilesByMsg = new Map();   // refUserMsgId → [fileRec]
+
+  window.addEventListener('message', (ev) => {
+    const d = ev && ev.data;
+    if (!d || d.type !== 'FL_WIRE_ZAI_CHATDATA' || !d.payload) return;
+    try {
+      const p = d.payload;
+      for (const uuid of Object.keys(p.messages || {})) {
+        wireData.messages[uuid] = p.messages[uuid];   // later batches overwrite (fresher)
+        (p.messages[uuid].files || []).forEach((f) => {
+          if (!f.refUserMsgId) return;
+          if (!wireFilesByMsg.has(f.refUserMsgId)) wireFilesByMsg.set(f.refUserMsgId, []);
+          const list = wireFilesByMsg.get(f.refUserMsgId);
+          if (!list.some((x) => x.id === f.id)) list.push(f);
+        });
+      }
+      wireData.batches += 1;
+      wireData.lastBatchAt = new Date().toISOString();
+      log('wire batch merged: messages=' + Object.keys(p.messages || {}).length +
+          ' total=' + Object.keys(wireData.messages).length +
+          ' files=' + wireFilesByMsg.size + ' msg-entries');
+    } catch (e) { /* never break */ }
+  });
+  try { window.postMessage({ type: 'FL_WIRE_READY', for: 'zai' }, '*'); } catch (e) {}
+
+  const wireRoundInfo = (promptMsgId, domText) => {
+    const m = wireData.messages[promptMsgId];
+    if (!m) return { captured: false };
+    let cross = 'no-content';
+    const wc = (m.content || '').replace(/\s+/g, ' ').trim();
+    if (wc) {
+      const dt = (domText || '').replace(/\s+/g, ' ');
+      cross = dt.includes(wc) ? 'match' : 'mismatch';
+    }
+    return {
+      captured: true,
+      modelInternal: m.model || null,
+      usage: m.usage || null,
+      reasoningChars: m.reasoning ? m.reasoning.length : null,
+      promptCrossCheck: cross,
+      batchesMerged: wireData.batches,
+      lastBatchAt: wireData.lastBatchAt
+    };
+  };
+
   const setStatus = (message, level = 'info') => {
     log(message);
     try {
@@ -389,44 +442,54 @@
     return !stillOpen();
   };
 
+  const fetchBlobViaBg = async (url) => {
+    const resp = await chrome.runtime.sendMessage({ type: 'FETCH_ASSET', url });
+    if (!resp || !resp.ok) throw new Error(resp ? resp.error : 'no background response');
+    return await (await fetch(resp.dataUrl)).blob();
+  };
+
+  // Two-tier asset fetch: in-page first (works when the CDN sends ACAO), then
+  // the SW fetch (D10) which ignores page CORS for permitted hosts.
+  const fetchAssetTwoTier = async (url) => {
+    try {
+      const r = await fetch(url);
+      if (r.ok) return await r.blob();
+      log('tier1 HTTP ' + r.status + ' — trying background');
+    } catch (e) {
+      log('tier1 failed (' + String(e).slice(0, 60) + ') — trying background');
+    }
+    return await fetchBlobViaBg(url);
+  };
+
   const bulkPreExtract = async () => {
     if (!ENABLE_ATTACHMENT_HARVEST) return;
     const userTurns = findTurns().filter((t) => t.role === 'user');
-    const chipLists = userTurns.map((t) => findAttachmentChips(t.el));
-    const total = chipLists.reduce((n, l) => n + l.length, 0);
+    const chipGroups = userTurns.map((t) => ({ turnId: t.id, chips: findAttachmentChips(t.el) }));
+    const total = chipGroups.reduce((n, g) => n + g.chips.length, 0);
     if (!total) return;
     log('bulkPreExtract: ' + total + ' attachment chip(s) detected');
     let done = 0, harvested = 0, failed = 0;
-    for (const chips of chipLists) {
-      for (const chip of chips) {
+    for (const group of chipGroups) {
+      for (const chip of group.chips) {
         done++;
         setStatus('Attachment ' + done + '/' + total + ': ' + chip.filename);
         const ext = extOf(chip.filename);
+        const stampFromBlob = (blob, source) => {
+          const blobUrl = URL.createObjectURL(blob);
+          chip.el.setAttribute('data-fl-attachment-blob', blobUrl);
+          chip.el.setAttribute('data-fl-attachment-name', chip.filename);
+          chip.el.setAttribute('data-fl-attachment-mime', blob.type || 'application/octet-stream');
+          chip.el.removeAttribute('data-fl-attachment-skip');
+          harvested++;
+          log('harvested ' + chip.filename + ' (' + blob.size + ' B, ' + source + ')');
+        };
+        // 1. Images: the chip thumbnail carries a current signed URL.
         if (chip.mediaSrc || ['jpg','jpeg','png','gif','webp'].includes(ext)) {
           setStatus('Attachment ' + done + '/' + total + ' (image): ' + chip.filename);
           try {
-            let blob = null;
-            try {
-              const r = await fetch(chip.mediaSrc);            // tier 1: in-page
-              if (!r.ok) throw new Error('HTTP ' + r.status);
-              blob = await r.blob();
-            } catch (pageErr) {
-              // tier 2: SW fetch ignores CORS for hosts in host_permissions.
-              // A stale signature surfaces here as 'HTTP 403' — distinct
-              // from the CORS failure that lands us in this catch.
-              log('in-page fetch failed (' + String(pageErr).slice(0, 80) + ') — trying background');
-              const resp = await chrome.runtime.sendMessage({ type: 'FETCH_ASSET', url: chip.mediaSrc });
-              if (!resp || !resp.ok) throw new Error(resp ? resp.error : 'no background response');
-              blob = await (await fetch(resp.dataUrl)).blob();
-            }
+            const blob = await fetchAssetTwoTier(chip.mediaSrc);
             if (blob.size > 10 * 1024 * 1024) throw new Error('over 10MB content.js blob limit');
-            const blobUrl = URL.createObjectURL(blob);
-            chip.el.setAttribute('data-fl-attachment-blob', blobUrl);
-            chip.el.setAttribute('data-fl-attachment-name', chip.filename);
-            chip.el.setAttribute('data-fl-attachment-mime', blob.type || 'application/octet-stream');
-            chip.el.removeAttribute('data-fl-attachment-skip');
-            harvested++;
-            log('harvested image ' + chip.filename + ' (' + blob.size + ' B)');
+            stampFromBlob(blob, 'thumbnail');
           } catch (e) {
             logErr('image harvest failed for ' + chip.filename + ':', String(e));
             chip.el.setAttribute('data-fl-attachment-skip', 'fetch-failed');
@@ -434,46 +497,60 @@
           }
           continue;
         }
-
-        if (!SAFE_TEXT_EXT.has(ext)) {
-          // PDF/video/etc: viewer shape unsampled. PDFs render via stale
-          // signed URL (403s); no in-page fetch URL is known yet. Record.
-          log('skip (type .' + ext + ' not yet harvestable): ' + chip.filename);
+        // 2. Known text types: open the viewer, capture the payload.
+        if (SAFE_TEXT_EXT.has(ext)) {
+          chip.el.click();
+          const viewer = await waitForViewer(6000);
+          if (!viewer) {
+            logErr('no viewer appeared for ' + chip.filename);
+            chip.el.setAttribute('data-fl-attachment-skip', 'no-viewer');
+            failed++;
+            continue;
+          }
+          const text = extractViewerText(viewer);
+          const closed = await closeViewer(viewer);
+          if (!text.trim()) {
+            logErr('viewer payload stayed empty for ' + chip.filename +
+              (closed ? '' : ' (viewer left open)'));
+            chip.el.setAttribute('data-fl-attachment-skip', 'empty');
+            failed++;
+            continue;
+          }
+          const blobUrl = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+          chip.el.setAttribute('data-fl-attachment-blob', blobUrl);
+          chip.el.setAttribute('data-fl-attachment-name', chip.filename);
+          if (chip.kind) chip.el.setAttribute('data-fl-attachment-kind', chip.kind);
+          if (chip.size) chip.el.setAttribute('data-fl-attachment-size', chip.size);
+          chip.el.removeAttribute('data-fl-attachment-skip');
+          harvested++;
+          log('harvested ' + chip.filename + ' (' + text.length + ' chars)' +
+              (closed ? '' : ' [viewer left open — close failed]'));
+          continue;
+        }
+        // 3. Everything else (PDF, docx, …): no DOM URL exists — resolve via
+        //    the wire files[] record (D14) and fetch the fresh cdn_url.
+        const wf = (wireFilesByMsg.get(group.turnId) || [])
+          .find((f) => f.filename === chip.filename);
+        if (!wf || !wf.cdnUrl) {
+          log('skip (type .' + ext + '; no wire file record): ' + chip.filename);
           chip.el.setAttribute('data-fl-attachment-skip', 'type-' + (ext || 'none'));
           continue;
         }
-
-        if (!SAFE_TEXT_EXT.has(ext)) {
-          log('skip (type .' + ext + ' not yet sampled): ' + chip.filename);
-          chip.el.setAttribute('data-fl-attachment-skip', 'type-' + (ext || 'none'));
-          continue;
-        }
-        chip.el.click();
-        const viewer = await waitForViewer(6000);
-        if (!viewer) {
-          logErr('no viewer appeared for ' + chip.filename);
-          chip.el.setAttribute('data-fl-attachment-skip', 'no-viewer');
+        setStatus('Attachment ' + done + '/' + total + ' (wire): ' + chip.filename);
+        try {
+          const blob = await fetchAssetTwoTier(wf.cdnUrl);
+          if (blob.size > 10 * 1024 * 1024) throw new Error('over 10MB content.js blob limit');
+          stampFromBlob(blob, 'wire');
+          if (wf.size && Math.abs(blob.size - wf.size) / wf.size > 0.02) {
+            log('note: harvested size differs from wire record (disk ' + blob.size +
+                ' vs wire ' + wf.size + ')');
+            chip.el.setAttribute('data-fl-attachment-wiresize', String(wf.size));
+          }
+        } catch (e) {
+          logErr('wire harvest failed for ' + chip.filename + ':', String(e));
+          chip.el.setAttribute('data-fl-attachment-skip', 'wire-fetch-failed');
           failed++;
-          continue;
         }
-        const text = extractViewerText(viewer);
-        const closed = await closeViewer(viewer);
-        if (!text.trim()) {
-          logErr('viewer payload stayed empty for ' + chip.filename +
-            (closed ? '' : ' (viewer left open)'));
-          chip.el.setAttribute('data-fl-attachment-skip', 'empty');
-          failed++;
-          continue;
-        }
-        const blobUrl = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
-        chip.el.setAttribute('data-fl-attachment-blob', blobUrl);
-        chip.el.setAttribute('data-fl-attachment-name', chip.filename);
-        if (chip.kind) chip.el.setAttribute('data-fl-attachment-kind', chip.kind);
-        if (chip.size) chip.el.setAttribute('data-fl-attachment-size', chip.size);
-        chip.el.removeAttribute('data-fl-attachment-skip');
-        harvested++;
-        log('harvested ' + chip.filename + ' (' + text.length + ' chars)' +
-            (closed ? '' : ' [viewer left open — close failed]'));
       }
     }
     setStatus('Attachments captured: ' + harvested + '/' + total +
@@ -504,15 +581,21 @@
         a.setAttribute('download', name || 'attachment');
         const mime = chip.getAttribute('data-fl-attachment-mime');
         if (mime) a.setAttribute('type', mime);
-        a.textContent = '[attachment: ' + name +
-          (kind ? ', ' + kind.toLowerCase() : '') + (size ? ', ' + size : '') + ']';
+        a.textContent = 'attachment: ' + name +
+          (kind ? ', ' + kind.toLowerCase() : '') + (size ? ', ' + size : '');
         chip.replaceWith(a);
       } else {
+        // Emit as a real anchor so content.js's anchor conversion renders it
+        // as a bracketed markdown token — same shape as harvested links —
+        // and the D13 extraction moves it into the attachment list. The
+        // sentinel href is a dead relative URL: content.js skips it from
+        // download (no file extension) and the dump shows it as a marker.
         const reason = chip.getAttribute('data-fl-attachment-skip') || 'not-captured';
-        const span = document.createElement('span');
-        span.setAttribute('data-fl-attachment', reason);
-        span.textContent = '[attachment: ' + name + ' — not captured: ' + reason + ']';
-        chip.replaceWith(span);
+        const a = document.createElement('a');
+        a.setAttribute('href', '_NOT_CAPTURED_' + (reason !== 'not-captured' ? '-' + reason : ''));
+        a.setAttribute('data-fl-attachment', reason);
+        a.textContent = 'attachment: ' + name + ' — not captured: ' + reason;
+        chip.replaceWith(a);
       }
     });
   };
@@ -686,6 +769,16 @@
     const responseHtml = a ? responseHtmlOf(a.el) : '';
     const assets = collectAssets(u.el, a ? a.el : null);
 
+    // Wire enrichment (D14): exact round match by message UUID. Backfill
+    // reasoning only when the DOM has none (collapsed at capture time).
+    let wireMsg = wireData.messages[u.id] || null;
+    const aWire = a ? wireData.messages[a.id] : null;
+    if (!think.html && aWire && aWire.reasoning) {
+      think.html = '<p>' + escapeHtml(aWire.reasoning) + '</p>';
+      think.wireBackfilled = true;
+    }
+    const domPromptText = (u.el.querySelector('.chat-user') || {}).textContent || '';
+
     const meta = {
       service: 'zai',
       roundIndex,
@@ -699,18 +792,20 @@
       userBubbleExpanded: userBubbleExpanded(u.el),
       thinking: {
         headerPresent: think.headerPresent,
-        contentCaptured: think.contentCaptured,
+        contentCaptured: think.contentCaptured || !!think.wireBackfilled,
         collapsedAtRest: think.collapsedAtRest,
         direct: think.direct,
+        source: think.wireBackfilled ? 'wire-backfill' : (think.html ? 'dom' : 'none')
       },
       assets,
       attachments: collectAttachmentRecords(u.el),
       codeGapCount: a ? a.el.querySelectorAll('.cm-gap').length : 0,
+      wire: wireRoundInfo(u.id, domPromptText),
       selectorsVerified: {
         turns: true, prompt: true, response: true, thinking: true,
         attachmentChip: true, attachmentViewer: true,
-        sessionName: false, model: false, sessionId: false,
-      },
+        model: true, sessionId: true, wire: false
+      }
     };
     if (extra) Object.assign(meta, extra);
 
@@ -720,9 +815,9 @@
       responseHtml,
       roundHtml: roundHtmlOf(promptHtml, think, responseHtml, {
         promptId: u.id,
-        responseId: a ? a.id : null,
+        responseId: a ? a.id : null
       }),
-      metadata: meta,
+      metadata: meta
     };
   };
 

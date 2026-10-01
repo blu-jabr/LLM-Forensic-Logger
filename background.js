@@ -691,11 +691,28 @@ function createMarkdown(payload, sessionId, roundNum) {
   let md = `# AI Forensic Log\n\n`;
   md += `**Session ID:** ${sessionId}\n`;
   if (payload.sessionName) md += `**Session Name:** ${payload.sessionName}\n`;
-  md += `**Round:** ${roundNum}\n`;
-  md += `\n## User Prompt\n\n${payload.prompt}\n\n`;
+  md += `**Round:** ${roundNum}\n\n`;
+
+  // D13: attachment links live inline in the prompt markdown (they must —
+  // content.js's pipeline created them there). Split them out for the .md:
+  // prompt as a blockquote, attachments as a list below, then a rule.
+  const ATT_RE = /\[+\s*attachment:[^\]]*\]+(?:\s*\([^)]*\))?/g;
+  const atts = [];
+  const promptBody = (payload.prompt || '')
+    .replace(ATT_RE, (m) => { atts.push(m.trim()); return ' '; })
+    .replace(/[ \t]+/g, (s, off, str) => str[off - 1] === '\n' || str[off + 1] === '\n' ? ' ' : s)
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  md += `## User Prompt\n\n`;
+  if (promptBody) {
+    md += promptBody.split('\n').map((l) => (l ? '> ' + l : '>')).join('\n') + '\n\n';
+  }
+  if (atts.length) md += atts.map((a) => '- ' + a).join('\n') + '\n\n';
+  md += `----\n\n`;
 
   if (payload.thinking && payload.thinking.trim().length > 0) {
-    md += `## AI Thinking\n\n\`\`\`\n${payload.thinking}\n\`\`\`\n\n`;
+    md += `## AI Thinking\n\n\`\`\`text\n${payload.thinking}\n\`\`\`\n\n----\n\n`;
   }
   md += `## AI Response\n\n${payload.response}\n`;
   return md;

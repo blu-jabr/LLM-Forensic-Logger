@@ -182,6 +182,88 @@
         }
     });
 
+    // ─── Wire capture receiver (D15) — from modules/inject_gemini_wire.js ───
+    const wireMediaByKey = new Map();   // lh3 urlKey → {filename, mime, bytes, w, h, downloadUrl, urls}
+    const wireTurnsByRc = new Map();    // rc_ id → {thoughts:[{title,text}], videos:[]}
+    const wireRcByResponse = new Map(); // r_ id → rc_ id (from id triples)
+    let wireConversationId = null;
+
+    const escapeHtml = (s) => String(s).replace(/[&<>"']/g,
+      (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    window.addEventListener('message', (ev) => {
+        const d = ev && ev.data;
+        if (!d || d.type !== 'FL_WIRE_GEMINI_HISTORY' || !d.payload) return;
+        try {
+            const p = d.payload;
+            if (p.conversationId && !wireConversationId) wireConversationId = p.conversationId;
+            (p.media || []).forEach((m) => {
+                if (m.key && !wireMediaByKey.has(m.key)) wireMediaByKey.set(m.key, m);
+            });
+            (p.turns || []).forEach((t) => {
+                if (!t.rcId) return;
+                const prev = wireTurnsByRc.get(t.rcId);
+                if (prev) {
+                    (t.thoughts || []).forEach((x) => {
+                        if (!prev.thoughts.some((y) => y.text === x.text)) prev.thoughts.push(x);
+                    });
+                } else {
+                    wireTurnsByRc.set(t.rcId, {
+                        thoughts: (t.thoughts || []).slice(),
+                        videos: (t.videos || []).slice()
+                    });
+                }
+            });
+            (p.triples || []).forEach((t) => {
+                const r = (t.ids || []).find((x) => x.charAt(0) === 'r' && x.charAt(1) === '_');
+                const rc = (t.ids || []).find((x) => x.charAt(0) === 'r' && x.charAt(1) === 'c' && x.charAt(2) === '_');
+                if (r && rc) wireRcByResponse.set(r, rc);
+            });
+            glog('wire history merged: media=' + wireMediaByKey.size +
+                 ' turns=' + wireTurnsByRc.size + ' r-map=' + wireRcByResponse.size);
+        } catch (e) { /* never break logging */ }
+    });
+    try { window.postMessage({ type: 'FL_WIRE_READY', for: 'gemini' }, '*'); } catch (e) {}
+
+    // D15: stamp original filenames onto wire-known media. content.js names
+    // downloads from the download attribute first, so this fixes the
+    // attachment-N/media-N fallback at the source.
+    const stampWireMediaNames = (clone) => {
+        if (!wireMediaByKey.size) return;
+        clone.querySelectorAll('img[src*="googleusercontent"], video[src*="googleusercontent"], video source[src*="googleusercontent"], a[href*="googleusercontent"]').forEach((el) => {
+            const src = el.getAttribute('src') || el.getAttribute('href') || '';
+            const rec = wireMediaByKey.get(src.split('=')[0]);
+            if (!rec) return;
+            if (rec.filename) el.setAttribute('download', rec.filename);
+            if (rec.mime) el.setAttribute('data-fl-wire-mime', rec.mime);
+            if (typeof rec.bytes === 'number') el.setAttribute('data-fl-wire-bytes', String(rec.bytes));
+        });
+    };
+
+    const wireThinkingFor = (md) => {
+        try {
+            const rIds = ((md && md.citations) || []).map((c) => c.response_id).filter(Boolean);
+            for (const r of rIds) {
+                const rc = wireRcByResponse.get(r);
+                const t = rc && wireTurnsByRc.get(rc);
+                if (t && t.thoughts && t.thoughts.length) return t;
+            }
+        } catch (e) {}
+        return null;
+    };
+
+    const wireSummary = () => ({
+        captured: wireMediaByKey.size > 0 || wireTurnsByRc.size > 0,
+        conversationId: wireConversationId,
+        mediaKnown: wireMediaByKey.size,
+        turnsKnown: wireTurnsByRc.size,
+        media: Array.from(wireMediaByKey.values()).slice(0, 100).map((m) => ({
+            filename: m.filename, mime: m.mime, bytes: m.bytes !== undefined ? m.bytes : null,
+            w: m.w !== undefined ? m.w : null, h: m.h !== undefined ? m.h : null,
+            downloadUrl: m.downloadUrl || null
+        }))
+    });
+
     // ─── Parsed-document chip resolution (content.js hook) ───
     // Runs on each DOMParser-parsed section BEFORE markdown conversion.
     // Resolution order per chip: stable-key cache (exact) -> container-id
@@ -362,6 +444,7 @@
     const cleanNode = (node) => {
         if (!node) return "";
         const clone = node.cloneNode(true);
+        try { stampWireMediaNames(clone); } catch (e) {}
         clone.querySelectorAll('button[aria-label="Copy"], button[aria-label="Listen"], button[aria-label="Share"], button[aria-label="Edit"], button[aria-label="Good response"], button[aria-label="Bad response"], button[aria-label="Generate more"]').forEach(el => el.remove());
         return clone.outerHTML || clone.innerHTML;
     };
@@ -437,13 +520,24 @@
 
         const userEl = lastTurn.querySelector('user-query-content, user-query, .query-text');
         const modelEl = lastTurn.querySelector('message-content, model-response, .response-container');
+        const md = extractMetadata(lastTurn);
+
+        let thinkingHtml = "";
+        const wt = wireThinkingFor(md);
+        if (wt) {
+            thinkingHtml = wt.thoughts.map((x) =>
+                '<p><strong>' + escapeHtml(x.title || '') + '</strong></p><p>' + escapeHtml(x.text || '') + '</p>'
+            ).join('\n');
+            md.wireThinking = { source: 'wire-lenient', blocks: wt.thoughts.length };
+        }
+        md.wire = wireSummary();
 
         return {
             promptHtml: cleanNode(userEl),
-            thinkingHtml: "",
+            thinkingHtml,
             responseHtml: cleanNode(modelEl),
             roundHtml: rawClone(lastTurn),
-            metadata: extractMetadata(lastTurn)
+            metadata: md
         };
     };
 
@@ -454,19 +548,24 @@
         for (let turn of turns) {
             const userEl = turn.querySelector('user-query-content, user-query, .query-text');
             const modelEl = turn.querySelector('message-content, model-response, .response-container');
+            const md = extractMetadata(turn);
+
+            let thinkingHtml = "";
+            const wt = wireThinkingFor(md);
+            if (wt) {
+                thinkingHtml = wt.thoughts.map((x) =>
+                    '<p><strong>' + escapeHtml(x.title || '') + '</strong></p><p>' + escapeHtml(x.text || '') + '</p>'
+                ).join('\n');
+                md.wireThinking = { source: 'wire-lenient', blocks: wt.thoughts.length };
+            }
+            md.wire = wireSummary();
 
             const promptHtml = cleanNode(userEl);
             const responseHtml = cleanNode(modelEl);
             const roundHtml = rawClone(turn);
 
             if (promptHtml || responseHtml || roundHtml) {
-                rounds.push({
-                    promptHtml,
-                    thinkingHtml: "",
-                    responseHtml,
-                    roundHtml,
-                    metadata: extractMetadata(turn)
-                });
+                rounds.push({ promptHtml, thinkingHtml, responseHtml, roundHtml, metadata: md });
             }
         }
         return rounds;

@@ -73,7 +73,14 @@
     },
     {
       "matches": ["*://gemini.google.com/*"],
-      "js": ["modules/inject_main_world.js"],
+      "js": ["modules/inject_main_world.js", "modules/inject_gemini_wire.js"],
+      "world": "MAIN",
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://chat.z.ai/*"],
+      "js": ["modules/inject_zai_wire.js"],
       "world": "MAIN",
       "all_frames": true,
       "run_at": "document_start"
