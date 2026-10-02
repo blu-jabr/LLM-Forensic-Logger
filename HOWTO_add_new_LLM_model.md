@@ -10,6 +10,8 @@ URL: [INSERT LLM URL]
 Module key: window.ForensicModules.[insert_module_name]   (valid JS identifier)
 Module file: modules/[insert_module_name].js
 
+----
+
 ## Architecture
 
 - modules/index.js loads first: defines window.ForensicModules = {} and the
@@ -20,6 +22,8 @@ Module file: modules/[insert_module_name].js
   or awaits bulkExtract() for the manual "Log Entire Session" button.
 - Media download, HTML->markdown conversion, and file writing all happen in
   content.js/background.js. The module only extracts DOM fragments.
+
+----
 
 ## Required module contract
 
@@ -81,6 +85,8 @@ Optional hooks (all call sites are guarded — omit if unneeded):
 
 (This also updates D8's "4th touchpoint" framing: the per-service checklist is now **module file with headers → make_plugin FILES → popup SUPPORTED**, with manifest generation automated.)
 
+----
+
 ## Example skeleton (isolated world, sync extract)
 
     // @match *://example-chat.example/*
@@ -120,6 +126,8 @@ Optional hooks (all call sites are guarded — omit if unneeded):
         window.ForensicModules.[insert_module_name] = { match, extract, bulkExtract };
     })();
 
+----
+
 ## Process notes for this session
 
 - The service's DOM structure may postdate your training data. Do not guess
@@ -131,6 +139,8 @@ Optional hooks (all call sites are guarded — omit if unneeded):
 - Keep all logic in this one module file. If something seems to require
   touching content.js or background.js, stop and say so — there is probably
   an existing hook, or one can be added deliberately.
+
+----
 
 ## Deviation ledger — deliberate frozen-file modifications (current through v1.32)
 
@@ -149,7 +159,7 @@ The architecture froze content.js and background.js. The following aredeliberate
 | D9 | popup.js | bulkStatus polling (chrome.storage.local `{bulkStatus:{service,message,level}}`), level-colored: red = errors only | progress visibility during long bulk runs |
 
 
-Module conventions to copy into new services (see modules/zai.js as reference):
+### Module conventions to copy into new services (see modules/zai.js as reference):
 
 - `setStatus(msg, level)` writing `{bulkStatus}` — optional; labels the popup line
 - `guarded(name, fn)` wrapper on exported contract functions — full stacks via derr before rethrowing
@@ -162,7 +172,7 @@ Module conventions to copy into new services (see modules/zai.js as reference):
   owner blocks --write.
 
 
-Process notes learned the hard way:
+### Process notes learned the hard way:
 
 - After ANY edit: make_plugin.sh → full test-dir repopulation → delete/re-add or reloadextension → refresh target tab. Stale builds masquerade as code bugs (three times).
 - Verify what Chrome actually loaded before debugging logic:`chrome.runtime.getManifest()` from the correct extension's SW console.
@@ -246,15 +256,6 @@ Appends to the ledger above. Numbering continues at D10.
   or the run stamps `unknown-host`.
 - Each bulk run resets the packet and mints a new SESSION_ID; one popup click per run.
 
-## Ledger addendum — (current through v2.0)
-
-Appends to the ledger above. Numbering continues at D13.
-
-| D13 | background.js createMarkdown | Prompt section restructured: attachment tokens extracted by regex ([+\s*attachment:[^\]]*]+\s*(\([^)]*\))?), prompt rendered as blockquote, attachments as a list below, ---- rule before Thinking/Response; thinking fence becomes ```text. Companion: zai.js placeholder attachments are anchor-shaped (_NOT_CAPTURED_-<reason> href) so the token regex sees them. | Forensic .md readability: prompt quoted, attachments inventoried, session assembly (notes/assemble_session.py) consumes the structure. |
-| D14 | manifest entry [2] + modules/inject_zai_wire.js + zai.js | MAIN-world wire injector: hooks fetch/XHR for POST /api/v1/chats/{id}/messages/batch; extracts messages/reasoning/usage/files[] (cdn_url+filename+size+content_type) only — raw responses never cross the boundary; buffers until FL_WIRE_READY. zai.js receiver merges batches per chatId; buildRound attaches metadata.wire (exact UUID round-match, promptCrossCheck vs DOM); bulkPreExtract harvests non-DOM-URL attachments (PDF) via files[] → FETCH_ASSET two-tier, byte-verified vs wire size. | The wire record is ground truth the DOM lacks (see notes/WIRE_CAPTURE_PLAYBOOK.md §1): PDF gap closed; wrapper bug evidenced per-round; true token usage and internal model ids recorded. |
-| D15 | manifest entry [1] + modules/inject_gemini_wire.js + gemini.js | batchexecute/hNvQHb injector: parses length-prefixed framing in the MAIN world, relays ONLY targeted structures (media entries, thought pairs, c_/r_/rc_ id triples) — safety-classifier telemetry dropped by construction. gemini.js: media keyed by lh3 URL-token (filenames duplicate across generation events); download-attribute stamping fixes attachment-N/media-N naming; thinking backfill via r_→rc_ join (citation-bearing rounds); metadata.wire media inventory with mime/bytes/dimensions; generated-video records (download URL, prompt, model, shot timeline). | Original filenames and thinking text are absent from the DOM (README limitation retired); video provenance captured from the wire record. |
-| D16 | background.js | B6 download verify becomes a poll: re-check downloads.search({id}) up to 6× at 3 s intervals while state === 'in_progress' (was a one-shot check at +3 s that logged false "interrupted" and skipped mime-verify/rename for slow downloads). | Large media or congested queues exceeded 3 s; false interrupts left files unverified/un-renamed. Observed 3× in one run. |
-| D17 | content.js | Media naming: when originalFilename carries a recognized extension, prefer it over the URL-derived ext (module wire-stamps the true filename into the download attribute; CDN URLs like lh3 have none). | .md placeholder extensions now match on-disk names for wire-named media (was …frames.bin in .md vs …frames.jpg on disk); background's B6 verify then agrees and skips the rename. |
 
 ### Known external site bug (bounds DOM-based capture — reported 2026-09-30)
 
@@ -268,3 +269,31 @@ repro, ordering/two-file probes, and wire evidence. Planned remediation = Track 
 MAIN-world fetch hook (pattern: modules/inject_main_world.js) capturing completion
 POSTs → per-round true submitted payload, plus per-attachment signed file URLs
 (retiring the short-signature-lifetime problem).
+
+----
+
+## Ledger addendum — (current through v2.0)
+
+Appends to the ledger above. Numbering continues at D13.
+
+| D13 | background.js createMarkdown | Prompt section restructured: attachment tokens extracted by regex ([+\s*attachment:[^\]]*]+\s*(\([^)]*\))?), prompt rendered as blockquote, attachments as a list below, ---- rule before Thinking/Response; thinking fence becomes ```text. Companion: zai.js placeholder attachments are anchor-shaped (_NOT_CAPTURED_-<reason> href) so the token regex sees them. | Forensic .md readability: prompt quoted, attachments inventoried, session assembly (notes/assemble_session.py) consumes the structure. |
+| D14 | manifest entry [2] + modules/inject_zai_wire.js + zai.js | MAIN-world wire injector: hooks fetch/XHR for POST /api/v1/chats/{id}/messages/batch; extracts messages/reasoning/usage/files[] (cdn_url+filename+size+content_type) only — raw responses never cross the boundary; buffers until FL_WIRE_READY. zai.js receiver merges batches per chatId; buildRound attaches metadata.wire (exact UUID round-match, promptCrossCheck vs DOM); bulkPreExtract harvests non-DOM-URL attachments (PDF) via files[] → FETCH_ASSET two-tier, byte-verified vs wire size. | The wire record is ground truth the DOM lacks (see notes/WIRE_CAPTURE_PLAYBOOK.md §1): PDF gap closed; wrapper bug evidenced per-round; true token usage and internal model ids recorded. |
+| D15 | manifest entry [1] + modules/inject_gemini_wire.js + gemini.js | batchexecute/hNvQHb injector: parses length-prefixed framing in the MAIN world, relays ONLY targeted structures (media entries, thought pairs, c_/r_/rc_ id triples) — safety-classifier telemetry dropped by construction. gemini.js: media keyed by lh3 URL-token (filenames duplicate across generation events); download-attribute stamping fixes attachment-N/media-N naming; thinking backfill via r_→rc_ join (citation-bearing rounds); metadata.wire media inventory with mime/bytes/dimensions; generated-video records (download URL, prompt, model, shot timeline). | Original filenames and thinking text are absent from the DOM (README limitation retired); video provenance captured from the wire record. |
+| D16 | background.js | B6 download verify becomes a poll: re-check downloads.search({id}) up to 6× at 3 s intervals while state === 'in_progress' (was a one-shot check at +3 s that logged false "interrupted" and skipped mime-verify/rename for slow downloads). | Large media or congested queues exceeded 3 s; false interrupts left files unverified/un-renamed. Observed 3× in one run. |
+| D17 | content.js | Media naming: when originalFilename carries a recognized extension, prefer it over the URL-derived ext (module wire-stamps the true filename into the download attribute; CDN URLs like lh3 have none). | .md placeholder extensions now match on-disk names for wire-named media (was …frames.bin in .md vs …frames.jpg on disk); background's B6 verify then agrees and skips the rename. |
+
+----
+
+## Project state & parked board (v2.0, post wire-capture session — 2026-10-01)
+
+**Complete modules:** gemini (citations, wire thinking-backfill forcitation-bearing rounds, wire filenames — verified at 132-round bulk) and zai (rounds, thinking DOM+wire, 100% attachment coverage: text via Bits UIviewer, image via thumbnail two-tier, PDF via wire files[]).
+**First drafts, need real work:** chatgpt, claude, duckai, google_flow, google-search-ai-logger, notebooklm. For a NEW service: wire discovery first (playbook §3), then DOM samples, then build from zai.js conventions.
+
+**Parked board** (described only here — carry forward or close explicitly):
+
+- `.d/attachments/` + `.d/media/` split (D18, frozen-file: content.js naming path) AND code-block scraping by language into `.d/<lang>/` subdirs — thescraping part is script-side only (assemble_session.py), no frozen-file change. NOTE: the split breaks rescue_attachments.py and assemble_session.py path assumptions — update both in the same round.
+- Storage-backed reload dedupe: content.js prompt dedupe is in-memory; a tab reload resets it and can double-log the last completed round. Old handoff sketched a storage-backed per-chatId lastPrompt.
+- z.ai wire-thinking surfacing: wireData already carries reasoning; rounds currently take thinking from DOM expand/restore only. Small follow-on to backfill from wireRoundInfo like gemini does.
+- Playbook §7 Gemini row: endpoint CONFIRMED (batchexecute rpcids=hNvQHb, length-prefixed framing; media/thought/triple shapes; drop classifier telemetry). Fold into the playbook file when next edited.
+- generate_manifest.sh: verified (dry-run + --write + live re-injection).MAIN-world check now scans all content_scripts entries.
+

@@ -222,7 +222,7 @@ Then add the file to the `content_scripts.js` array in `manifest.json` and add t
 **Gemini specifics:**
 
 - Thinking backfill via the wire requires the round to carry citations (the `r_→rc_` id-triple join); citation-less turns log `thinkingHtml: ""` pending a response-element id sample.
-- Wire coverage on very long (100+ round) sessions is unverified — the `hNvQHb` RPC's windowing behavior is unknown at depth.
+- Wire coverage on very long (100+ round) sessions is **now verified at 132 rounds**.
 - Generated-video records (download URL, prompt, model, shot timeline) are captured in round metadata; the videos themselves download via the same pipeline as other media.
 
 **Z.AI specifics:**
