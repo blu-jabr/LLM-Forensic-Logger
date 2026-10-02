@@ -32,6 +32,12 @@ if grep -q 'source-inline-chip' content.js; then
   echo "WARNING: service-specific DOM selectors found in content.js — refactor leak?"
 fi
 
+# Canary: every module in FILES must be referenced by manifest.json.
+for f in "${FILES[@]}"; do
+  case "$f" in modules/*.js) grep -q "$(basename "$f")" manifest.json || \
+    echo "WARNING: $f not referenced in manifest.json — stale manifest?";; esac
+done
+
 # Binary assets cannot survive a text heredoc; they are not archived.
 for ic in icons/cfi.16.png icons/cfi.32.png icons/cfi.48.png icons/cfi.128.png; do
   [ -f "$ic" ] || echo "WARNING: $ic missing — manifest.json references it; copy icons/ manually when restoring from this archive."

@@ -284,6 +284,14 @@ async function processHtmlAndMedia(data, modRef) {
                     originalFilename = url.split('/').pop().split('?')[0];
                 }
 
+                // D17: prefer the true filename's extension (module-stamped
+                // download attribute) over the URL-derived guess — CDN URLs
+                // like lh3 carry no extension, so the placeholder would be .bin
+                // while background's mime-verify later names the file .jpg.
+                if (originalFilename && /\.(png|jpe?g|gif|webp|mp4|webm|mov|pdf|txt|md|csv|docx?|xlsx?|pptx?|zip|json|mp3|wav|svg)$/i.test(originalFilename)) {
+                  ext = originalFilename.split('.').pop().toLowerCase();
+                }
+
                 if (originalFilename) {
                     let baseName = originalFilename.replace(/\.[^/.]+$/, "");
                     baseName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_');

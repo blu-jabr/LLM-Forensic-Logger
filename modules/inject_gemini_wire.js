@@ -13,7 +13,7 @@
 
   const buf = [];
   const RELAY = (msg) => { try { window.top.postMessage(msg, '*'); } catch (e) {} };
-  const relay = (msg) => { if (buf.length < 30) buf.push(msg); };
+  const relay = (msg) => { try { window.top.postMessage(msg, '*'); } catch (e) {} };
   window.addEventListener('message', (e) => {
     if (e && e.data && e.data.type === 'FL_WIRE_READY' && e.data.for === 'gemini') {
       while (buf.length) RELAY(buf.shift());
@@ -46,9 +46,25 @@
     return segs;
   }
 
-  function extractHistory(innerStr) {
-    let inner;
-    try { inner = JSON.parse(innerStr); } catch (e) { return null; }
+  const HEAD_RE = /^\[\["wrb\.fr","([A-Za-z0-9_]+)","/;
+
+  // Locate the inner JSON string positionally: [["wrb.fr","<rpcid>","<inner>"…
+  // The inner string is JSON-escaped; its closing quote is the first
+  // unescaped '"'. No assumptions about the trailing cells (null counts,
+  // whitespace, and newlines all vary between responses).
+  function extractInnerString(seg) {
+    const head = seg.match(HEAD_RE);
+    if (!head) return null;
+    let i = head[0].length;                 // first char of the inner string
+    while (i < seg.length) {
+      if (seg[i] === '\\') { i += 2; continue; }   // skip escaped char (\", \\, \n…)
+      if (seg[i] === '"') return { rpcid: head[1], raw: seg.slice(head[0].length, i) };
+      i++;
+    }
+    return null;
+  }
+
+  function extractHistory(inner) {
     const media = new Map();      // urlKey → record
     const turns = new Map();      // rc_ id → {thoughts, videos}
     const triples = [];
@@ -145,19 +161,41 @@
     if (typeof text !== 'string' || text.indexOf('hNvQHb') === -1) return;
     try {
       const segs = parseSegments(text);
-      if (!segs) return;
+      console.debug('[FL:wire-gemini] hNvQHb: segs=' + (segs ? segs.length : 'null'));
       for (const seg of segs) {
-        let arr;
-        try { arr = JSON.parse(seg); } catch (e) { continue; }
-        const cell = arr && arr[0] && arr[0][0];
-        if (cell && cell[0] === 'wrb.fr' && cell[1] === 'hNvQHb' && typeof cell[2] === 'string') {
-          const rec = extractHistory(cell[2]);
-          if (rec && (rec.media.length || rec.turns.length)) {
+        const ext = extractInnerString(seg);
+        if (!ext) {
+          console.debug('[FL:wire-gemini] seg not wrb.fr-shaped, len=' + seg.length);
+          continue;
+        }
+        // Single-pass unescape (order-safe: \\n survives as \n when preceded by \\)
+        const inner = ext.raw.replace(/\\\\|\\u003d|\\"|\\n|\\t|\\r/g,
+          (s) => ({ '\\\\':'\\', '\\u003d':'=', '\\"':'"', '\\n':'\n', '\\t':'\t', '\\r':'\r' }[s]));
+        // S1: strict parse. S2: escape any raw control chars (Google quirk).
+        let hist = null, how = null;
+        try {
+          hist = JSON.parse(inner); how = 'S1 strict';
+        } catch (e1) {
+          try {
+            hist = JSON.parse(inner.replace(/\n/g,'\\n').replace(/\r/g,'\\r').replace(/\t/g,'\\t'));
+            how = 'S2 control-escaped';
+          } catch (e2) {
+            console.debug('[FL:wire-gemini] inner parse fail: ' + String(e2).slice(0,100));
+            continue;
+          }
+        }
+        if (ext.rpcid === 'hNvQHb') {
+          const rec = extractHistory(hist);          // object-based signature
+          console.debug('[FL:wire-gemini] extract → media=' + rec.media.length +
+                        ' turns=' + rec.turns.length + ' triples=' + rec.triples.length);
+          if (rec.media.length || rec.turns.length) {
             relay({ type: 'FL_WIRE_GEMINI_HISTORY', payload: rec, at: Date.now() });
           }
         }
-      }
-    } catch (e) { /* never break the app */ }
+      }                                                  // ← closes `for`
+    } catch (e) {
+      console.debug('[FL:wire-gemini] handleResponseText threw: ' + String(e));
+    }
   }
 
   const origFetch = window.fetch;
@@ -185,7 +223,10 @@
   XO.send = function() {
     if ((this.__flWire || '').indexOf('batchexecute') !== -1) {
       this.addEventListener('load', () => {
-        try { handleResponseText(this.responseText); } catch (e) {}
+        try {
+          console.debug('[FL:wire-gemini] XHR done:', (this.__flWire||'').slice(0,80), 'rt=', this.responseType);
+          handleResponseText(this.responseType ? '' : this.responseText);
+        } catch (e) { console.debug('[FL:wire-gemini] XHR read failed:', String(e)); }
       });
     }
     return origSend.apply(this, arguments);

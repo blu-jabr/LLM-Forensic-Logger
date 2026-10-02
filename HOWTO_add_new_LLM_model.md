@@ -1,4 +1,4 @@
-# How to add a new LLM service (v1.32 architecture)
+# How to add a new LLM service (v2.0 architecture)
 
 I am building a Chromium MV3 extension that logs LLM chats round-by-round to
 local files. You will generate ONE new module file for a service. Do not
@@ -136,17 +136,18 @@ Optional hooks (all call sites are guarded — omit if unneeded):
 
 The architecture froze content.js and background.js. The following aredeliberate, reviewed deviations. New service modules must assume they exist.
 
-|#|File|Change|Why|
-|---|---|---|---|
-|D1|content.js|3× `console.error` → `derr`|bare console.error bypassed the debug-log pipeline; bulk failures were invisible in exported logs|
-|D2|content.js|live payload gains `module: matchedModuleName`|propagates matched module key to background for filenames/packet|
-|D3|content.js|bulk payload gains `module: moduleName`|same, bulk path|
-|D4|content.js|blob mime→ext map gains `text/*` subtypes + `application/json`|text attachments landed as `.bin`|
-|D5|background.js|BASE scheme: `flush.SESSION_ID.SERVICE.dateStr.timeStr.HOSTNAME.seq`; SERVICE sanitized from `payload.module`, derived inside logRound|per-service file identification|
-|D6|background.js|packetEntry gains `service: payload.module`; BULK_LOG_SESSION destructures `module` → per-round payloads|handoff reads service from the packet (survives SW restarts)|
-|D7|background.js|handoff BASE = `handoff.SESSION_ID.<last.service>.<export date/time>.HOSTNAME`|unified naming; export-time stamp is correct for a file generated later|
-|D8|popup.js|SUPPORTED regex must list every service host — a 4th per-service touchpoint (manifest matches, module file, make_plugin FILES, this regex)|popup gates routing BEFORE content scripts are consulted; a missing host silently bulk-logs the wrong tab (observed)|
-|D9|popup.js|bulkStatus polling (chrome.storage.local `{bulkStatus:{service,message,level}}`), level-colored: red = errors only|progress visibility during long bulk runs|
+| # | File | Change | Why |
+| --- | --- | --- | --- |
+| D1 | content.js | 3× `console.error` → `derr` | bare console.error bypassed the debug-log pipeline; bulk failures were invisible in exported logs |
+| D2 | content.js | live payload gains `module: matchedModuleName` | propagates matched module key to background for filenames/packet |
+| D3 | content.js | bulk payload gains `module: moduleName` | same, bulk path |
+| D4 | content.js | blob mime→ext map gains `text/*` subtypes + `application/json` | text attachments landed as `.bin` |
+| D5 | background.js | BASE scheme: `flush.SESSION_ID.SERVICE.dateStr.timeStr.HOSTNAME.seq`; SERVICE sanitized from `payload.module`, derived inside logRound | per-service file identification |
+| D6 | background.js | packetEntry gains `service: payload.module`; BULK_LOG_SESSION destructures `module` → per-round payloads | handoff reads service from the packet (survives SW restarts) |
+| D7 | background.js | handoff BASE = `handoff.SESSION_ID.<last.service>.<export date/time>.HOSTNAME` | unified naming; export-time stamp is correct for a file generated later |
+| D8 | popup.js | SUPPORTED regex must list every service host — a 4th per-service touchpoint (manifest matches, module file, make_plugin FILES, this regex) | popup gates routing BEFORE content scripts are consulted; a missing host silently bulk-logs the wrong tab (observed) |
+| D9 | popup.js | bulkStatus polling (chrome.storage.local `{bulkStatus:{service,message,level}}`), level-colored: red = errors only | progress visibility during long bulk runs |
+
 
 Module conventions to copy into new services (see modules/zai.js as reference):
 
@@ -244,6 +245,16 @@ Appends to the ledger above. Numbering continues at D10.
   packets, caches) — re-enter the hostname in options BEFORE clicking the test page,
   or the run stamps `unknown-host`.
 - Each bulk run resets the packet and mints a new SESSION_ID; one popup click per run.
+
+## Ledger addendum — (current through v2.0)
+
+Appends to the ledger above. Numbering continues at D13.
+
+| D13 | background.js createMarkdown | Prompt section restructured: attachment tokens extracted by regex ([+\s*attachment:[^\]]*]+\s*(\([^)]*\))?), prompt rendered as blockquote, attachments as a list below, ---- rule before Thinking/Response; thinking fence becomes ```text. Companion: zai.js placeholder attachments are anchor-shaped (_NOT_CAPTURED_-<reason> href) so the token regex sees them. | Forensic .md readability: prompt quoted, attachments inventoried, session assembly (notes/assemble_session.py) consumes the structure. |
+| D14 | manifest entry [2] + modules/inject_zai_wire.js + zai.js | MAIN-world wire injector: hooks fetch/XHR for POST /api/v1/chats/{id}/messages/batch; extracts messages/reasoning/usage/files[] (cdn_url+filename+size+content_type) only — raw responses never cross the boundary; buffers until FL_WIRE_READY. zai.js receiver merges batches per chatId; buildRound attaches metadata.wire (exact UUID round-match, promptCrossCheck vs DOM); bulkPreExtract harvests non-DOM-URL attachments (PDF) via files[] → FETCH_ASSET two-tier, byte-verified vs wire size. | The wire record is ground truth the DOM lacks (see notes/WIRE_CAPTURE_PLAYBOOK.md §1): PDF gap closed; wrapper bug evidenced per-round; true token usage and internal model ids recorded. |
+| D15 | manifest entry [1] + modules/inject_gemini_wire.js + gemini.js | batchexecute/hNvQHb injector: parses length-prefixed framing in the MAIN world, relays ONLY targeted structures (media entries, thought pairs, c_/r_/rc_ id triples) — safety-classifier telemetry dropped by construction. gemini.js: media keyed by lh3 URL-token (filenames duplicate across generation events); download-attribute stamping fixes attachment-N/media-N naming; thinking backfill via r_→rc_ join (citation-bearing rounds); metadata.wire media inventory with mime/bytes/dimensions; generated-video records (download URL, prompt, model, shot timeline). | Original filenames and thinking text are absent from the DOM (README limitation retired); video provenance captured from the wire record. |
+| D16 | background.js | B6 download verify becomes a poll: re-check downloads.search({id}) up to 6× at 3 s intervals while state === 'in_progress' (was a one-shot check at +3 s that logged false "interrupted" and skipped mime-verify/rename for slow downloads). | Large media or congested queues exceeded 3 s; false interrupts left files unverified/un-renamed. Observed 3× in one run. |
+| D17 | content.js | Media naming: when originalFilename carries a recognized extension, prefer it over the URL-derived ext (module wire-stamps the true filename into the download attribute; CDN URLs like lh3 have none). | .md placeholder extensions now match on-disk names for wire-named media (was …frames.bin in .md vs …frames.jpg on disk); background's B6 verify then agrees and skips the rename. |
 
 ### Known external site bug (bounds DOM-based capture — reported 2026-09-30)
 

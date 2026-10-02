@@ -88,8 +88,10 @@ NEW_PERMS=$(comm -13 <(echo "$CUR_PERMS") <(echo "$DERIVED_PERMS"))
 for f in "${MAIN_FILES[@]:-}"; do
     [ -z "$f" ] && continue
     host=$(grep -oP '@match \K.*' "$f" | head -1)
-    grep -qF "\"$host\"" <(jq -r '.content_scripts[1].matches[]' "$MANIFEST") \
-        || echo "⚠ MAIN-world file $f host '$host' not found in content_scripts[1].matches (hand-maintained entry)"
+    if ! jq -e --arg h "$host" \
+         'any(.content_scripts[]; (.matches | index($h)))' "$MANIFEST" >/dev/null; then
+        echo "⚠ MAIN-world file $f host '$host' not found in any content_scripts entry (hand-maintained)"
+    fi
 done
 
 # ── Build and (maybe) write ──

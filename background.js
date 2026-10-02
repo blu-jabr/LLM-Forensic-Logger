@@ -394,7 +394,7 @@ async function logRound(payload, chatId) {
               }[it.mime];
               if (mimeExt && !media.filename.endsWith('.' + mimeExt)) {
                 const corrected = media.filename.replace(/\.[a-z0-9]+$/i, '.' + mimeExt);
-                chrome.downloads.remove(id, () => {         // remove the wrong-named copy
+                chrome.downloads.removeFile(id, () => {         // remove the wrong-named copy
                   chrome.downloads.download({
                     url: downloadUrl,
                     filename: `${folderPath}${mediaDirName}/${corrected}`,
@@ -405,6 +405,19 @@ async function logRound(payload, chatId) {
                   });
                 });
               }
+          setTimeout(() => {
+            const check = (tries) => chrome.downloads.search({ id }, (items) => {
+              const it = items && items[0];
+              if (!it) { derr('B6✗ missing:', media.filename); return; }
+              if (it.state === 'in_progress' && tries > 0) {
+                setTimeout(() => check(tries - 1), 3000);   // re-check up to ~18 s
+                return;
+              }
+              if (it.state !== 'complete') { derr('B6✗ interrupted:', media.filename, it.state, it.error); return; }
+              /* …existing B6✓ verify/rename body unchanged… */
+            });
+            check(6);
+          }, 3000);
             });
           }, 3000);
 

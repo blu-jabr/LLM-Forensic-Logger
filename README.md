@@ -2,6 +2,8 @@
 
 A Manifest V3 Chromium extension that performs forensic logging of LLM chat sessions to the local filesystem. Every round of a conversation — the user's prompt, the model's thinking, and the model's response — is captured as GitHub-flavored Markdown, accompanied by JSON metadata for drift/hallucination analysis, a pristine XHTML snapshot of the DOM, and downloaded media. Nothing leaves the machine: no telemetry, no network calls, no accounts.
 
+As of v2.0, each service may also carry a MAIN-world **wire injector** (`modules/inject_*_wire.js`) that records the service's own chat-data API traffic — the ground-truth record behind the rendered DOM — enabling attachment harvesting, original filenames, reasoning-text capture, and true token metrics that no DOM-only logger can reach. See `notes/WIRE_CAPTURE_PLAYBOOK.md`.
+
 ```text
 ~/Downloads/LLM-Forensic-Logger/
 └── 2026-09-29/
@@ -22,8 +24,8 @@ A Manifest V3 Chromium extension that performs forensic logging of LLM chat sess
 
 | Target | Module | Notes |
 |---|---|---|
-| Google Gemini | `modules/gemini.js` | Most complete: citations, media, thinking hooks |
-| Z.AI (chat.z.ai) | modules/zai.js | Complete: rounds, thinking (auto-expand/restore in bulk), text+image attachment harvesting, per-round status |
+| Google Gemini | modules/gemini.js | Complete: citations, media, thinking (wire-backfilled), wire filenames/metadata |
+| Z.AI (chat.z.ai) | modules/zai.js | Complete: rounds, thinking, 100% attachment coverage (text/image/PDF via wire), wire metadata |
 | ChatGPT | `modules/chatgpt.js` | Includes o-series reasoning blocks |
 | Claude | `modules/claude.js` | Includes thinking blocks |
 | NotebookLM | `modules/notebooklm.js` | |
@@ -93,12 +95,18 @@ Click **Download Debug Log** to export the extension's breadcrumb audit trail (c
 │ modules/inject_main_world.js — wraps window.open; relays anchor navigations  │
 │   (left/middle click) from the page's own context to the isolated world      │
 │   via click + auxclick capture listeners and composedPath()                  │
+│ modules/inject_zai_wire.js — passive fetch/XHR observer: chat-data batches   │
+│   → messages, reasoning, usage, files[] (z.ai)                               │
+│ modules/inject_gemini_wire.js — batchexecute parser: hNvQHb history →        │
+│   media entries, thought pairs, id triples (Gemini)                          │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why a MAIN-world injector?
 
 Content scripts run in an isolated world: they share the page's DOM but not its JavaScript. Gemini's citation navigation happens in the page's own context (lazy anchor injection, `window.open`, browser-native middle-click handling), so interception requires a script in the MAIN world (`"world": "MAIN"`, `all_frames: true`, `document_start`) relaying events via `postMessage`. See [Gemini DOM notes](#gemini-dom-notes).
+
+v2.0 adds a second use: **wire observation**. Some data (original attachment filenames, reasoning text, signed asset URLs, token usage) exists only in the services' chat-data API responses, never in the DOM. The injectors are strictly passive — they observe and relay; they never modify app traffic — and they relay only targeted structures (z.ai: message/reasoning/usage/files records; Gemini: media entries, thought pairs, id triples). The Gemini parser drops the response's embedded safety-classifier telemetry by construction: it never crosses into extension storage.
 
 ### Citation resolution order
 
@@ -119,6 +127,14 @@ Every URL carries `url_match_type` provenance. Multi-citation chips (one chip, s
   "timestamp_logged_utc": "…", "hostname": "…",
   "gemini_metadata": {
     "testIds": ["uploaded-img", "…"],
+    "wire": {                       // v2.0 — chat-data API capture
+      "captured": true,
+      "modelInternal": "x-preview-l",   // vs UI label "GLM-5.3-Flash"
+      "usage": { "prompt_tokens": 18763, "completion_tokens": 1574,
+                 "cached_tokens": 13824 },
+      "reasoningChars": 2411,
+      "promptCrossCheck": "match"       // DOM prompt vs wire record
+    },
     "citation_chips": [{
       "source_title": "UNDP Climate Promise - …",
       "url": "https://climatepromise.undp.org/…#:~:text=…",
@@ -138,6 +154,8 @@ Every URL carries `url_match_type` provenance. Multi-citation chips (one chip, s
 ```
 
 Service metadata nests under `gemini_metadata` for all services (frozen-file key, kept for consumer compatibility)."
+
+_"`wire` is service-generic despite the outer `gemini_metadata` key (frozen-file naming, kept for consumer compatibility)."_
 
 ## Extension storage schema (chrome.storage.local)
 
@@ -193,38 +211,76 @@ Then add the file to the `content_scripts.js` array in `manifest.json` and add t
 - `notes/` contains reusable console snippets (cache purge, chip inventory, storage dump).
 - **Hosts**: development happens on whichever workstation is current (e.g. `sugarloaf`); `seacouver` is the permanent git origin. Filenames embed the _hostname where the round was logged_ (`options` → `hostname` field), so multi-host use produces self-identifying output; it is not a repo identifier.
 
-
 ## Known limitations
 
 - Round timing (`generation_duration_ms`) is approximate for bulk-logged historical sessions (0 by design).
-- Uploaded attachments on Gemini keep their CDN URL in the XHTML but not their original filename — Google strips it from the client-side DOM (recoverable via `myactivity.google.com` cross-reference).
-- Sub-citation *labels* within multi-citation chips are approximate (first source's title); URLs are exact. Exact labels require parsing the sources dialog (deferred; the relay hook for it exists).
+- Sub-citation _labels_ within multi-citation chips are approximate (first source's title); URLs are exact. Exact labels require parsing the sources dialog (deferred; the relay hook for it exists).
 - Citation capture is manual by design. (Playwright automation is a future possibility; requires Google auth in an automated browser.)
 - Extension storage is per-browser-profile; clearing site data or removing the extension erases caches, sessions, and the hostname.
+- The `.md` attachment placeholder is named before the browser verifies the downloaded file's mime; background.js's later mime-correction renames the _file_ but not the `.md` text — they can briefly disagree (cosmetic).
 
-**Z.AI specifics**:
+**Gemini specifics:**
+
+- Thinking backfill via the wire requires the round to carry citations (the `r_→rc_` id-triple join); citation-less turns log `thinkingHtml: ""` pending a response-element id sample.
+- Wire coverage on very long (100+ round) sessions is unverified — the `hNvQHb` RPC's windowing behavior is unknown at depth.
+- Generated-video records (download URL, prompt, model, shot timeline) are captured in round metadata; the videos themselves download via the same pipeline as other media.
+
+**Z.AI specifics:**
 
 - Attachment CDN signatures are short-lived (~minutes, observed ~8): harvesting must happen at render time on a freshly loaded page; stored URLs 403 for every fetcher, including `chrome.downloads`.
-- PDF attachments are recorded (filename/kind/size, honest placeholder) but not harvested — the chip triggers a direct download from a URL that never appearsin the DOM.
-- The site injects a server-side wrapper (incl. an unconditional "Please help me:" line) around text attachments before model inference; the wrapper is invisible in the transcript, so the DOM capture is faithful to what the page showed but not to what the model received (reported upstream 2026-09-30). A MAIN-world wire-capture hook is the planned remediation.
+- The site injects a server-side wrapper (incl. an unconditional "Please help me:" line) around text attachments before model inference; the wrapper is invisible in the transcript, so the DOM capture is faithful to what the page showed but not to what the model received (reported upstream 2026-09-30). Per-round `wire.promptCrossCheck` documents the divergence; the wrapper itself is only observable via the model's own reproduction.
+- Live rounds report `wire.captured: false` until the next chat-data batch fetch (fires on load and on scroll pagination).
 - Whether the transcript virtualizes at long lengths is unverified (bulk coverage confirmed only at ~39 rounds).
+- Viewer-text harvests are content-faithful, not byte-faithful (±20 B on CRLF/terminator differences vs. the served file).
 
 ## Repository layout
 
-```
+```text
 LLM-Forensic-Logger/
-├── manifest.json              # v1.32 — header-owned; regenerate via generate_manifest.sh
-├── ...
-│   ├── gemini.js              # includes stampChips() + getSessionName()
-│   ├── zai.js                 # rounds, thinking, attachment harvesting (text + image)
-│   ├── chatgpt.js  claude.js  duckai.js  notebooklm.js
-│   ├── google-search-ai-logger.js  google_flow.js
-├── generate_manifest.sh       # header-driven manifest regeneration (dry-run default)
-├── notes/                     # console snippets, syntax_check.sh, rescue_attachments.py
+├── manifest.json               # v2.0 — header-owned; regenerate via generate_manifest.sh
+├── background.js               # service worker: queue, state, handoff, citation index,
+│                               #   media + FETCH_ASSET, manifest export, debug store
+├── content.js                  # orchestrator: live/bulk extraction, HTML->MD engine,
+│                               #   media pipeline, debug bus (frozen; see ledger)
+├── popup.html / popup.js       # Log Entire Session - Generate Handoff -
+│                               #   Export Download Manifest - Download Debug Log
+├── options.html / options.js   # hostname configuration (cached in storage)
+├── generate_manifest.sh        # header-driven manifest regeneration (dry-run default)
+├── make_plugin.sh              # self-extracting plugin.txt builder (22 chunks)
+├── plugin.txt                  # generated archive (bootstrap protocol)
+├── HOWTO_add_new_LLM_model.md  # new-service process + deviation ledger (D1-D15)
+├── CHANGELOG.md                # per-version blocks
+├── Directory_Structure.md      # (older layout doc; see this section first)
+├── make_howto_prompt.py        # regenerates the HOWTO prompt template
+├── icons/                      # cfi.{16,32,48,128}.png, cfi.svg
+├── modules/
+│   ├── index.js                # window.ForensicModules = {} + dlog/derr
+│   ├── chatgpt.js              # first draft
+│   ├── claude.js               # first draft
+│   ├── duckai.js               # first draft
+│   ├── gemini.js               # COMPLETE: citations (chip pipeline), media,
+│   │                           #   thinking (wire-backfilled), wire filenames
+│   ├── google_flow.js          # first draft
+│   ├── google-search-ai-logger.js  # first draft
+│   ├── notebooklm.js           # first draft
+│   ├── zai.js                  # COMPLETE: rounds, thinking (DOM+wire), 100%
+│   │                           #   attachment coverage (text/image/PDF via wire)
+│   ├── inject_main_world.js    # MAIN world (Gemini): window.open + anchor nav relay
+│   ├── inject_zai_wire.js      # MAIN world (z.ai): chat-data batch observer   [v2.0]
+│   └── inject_gemini_wire.js   # MAIN world (Gemini): batchexecute hNvQHb parser [v2.0]
+└── notes/
+    ├── WIRE_CAPTURE_PLAYBOOK.md    # wire discovery method + contracts    [v2.0]
+    ├── assemble_session.py         # flush.*.md -> session(.complete).md
+    ├── rescue_attachments.py       # download-manifest -> .d/ recovery joins
+    ├── syntax_check.sh             # parse-check all .js (run before every reload)
+    ├── chip_inventory.js           # citation chip inventory (gemini)
+    ├── purge_snippet.js            # storage cache purge
+    ├── test_battery.txt            # manual test checklist
+    └── (scratch: *.json, drafts)   # session artifacts, not documentation
 ```
 
 ## Privacy & forensic stance
 
-All processing and storage is local. The extension makes no third-party network requests; its only outbound fetches are attachment files from the chat service's own asset CDN (scoped by host_permissions), performed during explicit harvesting. Media otherwise downloads via the browser's download manager against URLs already present in the page.
+The extension makes no third-party network requests; its only outbound fetches are attachment files from the chat services' own asset CDNs (scoped by host_permissions). The wire injectors are passive observers of the same page's own API traffic and store only targeted forensic structures — they do not record safety-classifier telemetry or other incidental payloads present in those responses.
 
 Logs are written under the user's Downloads directory in a `LLM-Forensic-Logger/` namespace. The design principle throughout: **record what the page actually showed, preserve original URLs alongside local copies, flag uncertainty instead of resolving it silently, and never summarize what can be quoted.**

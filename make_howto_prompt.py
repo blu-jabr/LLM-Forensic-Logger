@@ -10,7 +10,7 @@ config.json schema:
       "llm_name": "Z.AI",            # human-readable service name
       "llm_url": "https://chat.z.ai",
       "module_name": "zai",          # must be a valid JS identifier
-      "current_version": "1.29"      # optional; if absent, [CURRENT_VERSION] is left
+      "current_version": "2.0"      # optional; if absent, [CURRENT_VERSION] is left
     }
 """
 
